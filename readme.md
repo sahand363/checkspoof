@@ -1,4 +1,1 @@
-apt-get update && apt-get install -y wget && \
-mkdir -p /opt/checkspoof && cd /opt/checkspoof && \
-wget -O checkspoof https://github.com/sahand363/checkspoof/releases/latest/download/checkspoof && \
-chmod +x checkspoof && ./checkspoof
+sudo curl -L -o /usr/local/bin/checkspoof https://github.com/sahand333/checkspoof/releases/latest/download/checkspoof && sudo chmod +x /usr/local/bin/checkspoof && sudo checkspoof
