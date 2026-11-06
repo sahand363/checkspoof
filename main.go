@@ -17,10 +17,23 @@ import (
 )
 
 var (
-	serverIP  string
-	authToken string
-	port      = "5000"
+	serverIP    string
+	authToken   string
+	port        = "5000"
+	mu          sync.Mutex
+	liveLogs    []string
 )
+
+func addLiveLog(msg string) {
+	mu.Lock()
+	defer mu.Unlock()
+	timestamp := time.Now().Format("15:04:05")
+	line := fmt.Sprintf("[%s] %s", timestamp, msg)
+	if len(liveLogs) > 50 {
+		liveLogs = liveLogs[1:]
+	}
+	liveLogs = append(liveLogs, line)
+}
 
 type TestRequest struct {
 	TargetIP    string `json:"target_ip"`
@@ -43,7 +56,6 @@ type ListenRequest struct {
 type ListenResponse struct {
 	ReceivedCount int    `json:"received_count"`
 	Log           string `json:"log"`
-	Error         string `json:"error,omitempty"`
 }
 
 type PageData struct {
@@ -57,48 +69,56 @@ const htmlPage = `
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <title>ابزار دوطرفه تحلیل IP Spoofing (Go Native)</title>
+    <title>ابزار دوطرفه تحلیل IP Spoofing</title>
     <style>
         body { background-color: #0f172a; color: #f8fafc; font-family: monospace; margin: 0; padding: 20px; }
-        .container { max-width: 920px; margin: auto; background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        .container { max-width: 950px; margin: auto; background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
         h1 { text-align: center; color: #38bdf8; font-size: 22px; margin-bottom: 5px; }
         .server-info { text-align: center; color: #94a3b8; font-size: 13px; margin-bottom: 15px; }
         .server-info span { color: #38bdf8; font-weight: bold; }
-        .token-box { background: #090d16; border: 1px dashed #38bdf8; padding: 12px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; direction: ltr; }
+        .token-box { background: #090d16; border: 1px dashed #38bdf8; padding: 12px; border-radius: 8px; margin-bottom: 15px; display: flex; justify-content: space-between; align-items: center; direction: ltr; }
         .token-box code { color: #4ade80; font-size: 14px; word-break: break-all; }
-        .copy-btn { background: #334155; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; width: auto; font-size: 12px; }
+        .copy-btn { background: #334155; color: #fff; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
         .copy-btn:hover { background: #475569; }
         .section { margin-bottom: 20px; padding: 15px; background: #0f172a; border-radius: 8px; border: 1px solid #334155; }
         label { display: block; margin-bottom: 5px; color: #94a3b8; }
-        input, select { width: 100%; padding: 10px; margin-bottom: 12px; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box; }
+        input, select { width: 100%; padding: 10px; margin-bottom: 10px; background: #1e293b; border: 1px solid #475569; color: #fff; border-radius: 6px; box-sizing: border-box; }
+        .connect-row { display: flex; gap: 10px; margin-bottom: 10px; }
         button.main-btn { background: #0284c7; color: white; border: none; padding: 12px 20px; font-size: 16px; border-radius: 6px; cursor: pointer; width: 100%; font-weight: bold; transition: 0.2s; }
         button.main-btn:hover { background: #0ea5e9; }
         button.main-btn:disabled { background: #475569; cursor: not-allowed; }
+        button.sub-btn { background: #059669; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; white-space: nowrap; }
+        button.sub-btn:hover { background: #10b981; }
         .status-box { padding: 12px; border-radius: 6px; text-align: center; font-weight: bold; margin-top: 10px; }
         .success { background: #14532d; color: #4ade80; border: 1px solid #166534; }
         .warning { background: #713f12; color: #facc15; border: 1px solid #854d0e; }
         .failure { background: #7f1d1d; color: #f87171; border: 1px solid #991b1b; }
-        #terminal { background: #000; color: #00ff00; padding: 15px; border-radius: 6px; height: 320px; overflow-y: scroll; font-size: 13px; border: 1px solid #334155; white-space: pre-wrap; direction: ltr; text-align: left; }
+        .terminal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+        #terminal { background: #000; color: #00ff00; padding: 15px; border-radius: 6px; height: 280px; overflow-y: scroll; font-size: 13px; border: 1px solid #334155; white-space: pre-wrap; direction: ltr; text-align: left; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>ابزار تحلیل دوطرفه IP Spoofing (فرستنده و گیرنده)</h1>
+        <h1>ابزار تحلیل دوطرفه IP Spoofing</h1>
         <div class="server-info">
-            آدرس این سرور: <span>{{.ServerIP}}:5000</span> | اینترفیس: <span>{{.Iface}}</span>
+            آدرس این سرور: <span>{{.ServerIP}}:5000</span> | اینترفیس شبکه: <span>{{.Iface}}</span>
         </div>
 
-        <label>🔑 توکن اتصال این سرور (این کد را در سرور دیگر کپی کنید تا به این سرور متصل شود):</label>
+        <label>🔑 توکن اتصال این سرور (کد زیر را کپی کرده و در سرور دیگر وارد کنید):</label>
         <div class="token-box">
             <code id="my_token">{{.ConnectionCode}}</code>
             <button class="copy-btn" onclick="copyToken()">Copy Token</button>
         </div>
 
         <div class="section">
-            <label>🔗 توکن سرور دوم / مقصد (اختیاری - برای تایید ۱۰۰٪ دریافت پکت در سرور مقابل):</label>
-            <input type="text" id="remote_token" placeholder="مثال: 198.55.102.149:5000|a1b2c3d4..." oninput="extractTargetIP(this.value)" style="direction:ltr;">
+            <label>🔗 توکن سرور مقابل (برای اتصال دوطرفه و تایید ۱۰۰٪ پکت‌ها):</label>
+            <div class="connect-row">
+                <input type="text" id="remote_token" placeholder="مثال: 198.55.102.149:5000|a1b2c3d4..." oninput="extractTargetIP(this.value)" style="direction:ltr; margin-bottom:0;">
+                <button class="sub-btn" onclick="testConnection()">اتصال و تست لینک</button>
+            </div>
+            <div id="connection_status"></div>
 
-            <label>🎯 IP مقصد (Target IP):</label>
+            <label style="margin-top: 12px;">🎯 IP مقصد (Target IP):</label>
             <input type="text" id="target_ip" placeholder="مثال: 198.55.102.149" style="direction:ltr;">
             
             <label>🎭 IP جعلی (Spoof IP):</label>
@@ -115,8 +135,11 @@ const htmlPage = `
             <div id="status_result"></div>
         </div>
         <div class="section">
-            <h3>لاگ زنده ترمینال (هر دو سرور)</h3>
-            <div id="terminal">Ready...</div>
+            <div class="terminal-header">
+                <h3 style="margin:0;">لاگ زنده و وضعیت گوش‌به‌زنگی (Live Activity)</h3>
+                <span id="listener_badge" style="background: #1e293b; color: #94a3b8; padding: 3px 8px; border-radius: 4px; font-size: 11px;">⚪ حالت عادی</span>
+            </div>
+            <div id="terminal">System ready. Waiting for action...</div>
         </div>
     </div>
     <script>
@@ -134,21 +157,69 @@ const htmlPage = `
             }
         }
 
+        // Poll logs from the server every 1.5 seconds so both sender and receiver see activity live
+        setInterval(() => {
+            fetch('/api/logs')
+            .then(res => res.json())
+            .then(data => {
+                if(data.logs && data.logs.length > 0) {
+                    let term = document.getElementById('terminal');
+                    term.innerText = data.logs.join("\n");
+                    term.scrollTop = term.scrollHeight;
+                }
+                let badge = document.getElementById('listener_badge');
+                if(data.is_listening) {
+                    badge.style.background = "#14532d";
+                    badge.style.color = "#4ade80";
+                    badge.innerText = "🔴 در حال شنود پکت‌های ICMP...";
+                } else {
+                    badge.style.background = "#1e293b";
+                    badge.style.color = "#94a3b8";
+                    badge.innerText = "⚪ آماده به کار";
+                }
+            }).catch(e=>{});
+        }, 1500);
+
+        function testConnection() {
+            let remoteToken = document.getElementById('remote_token').value.trim();
+            let connBox = document.getElementById('connection_status');
+            if(!remoteToken) { alert('لطفا ابتدا توکن سرور مقابل را وارد کنید'); return; }
+
+            connBox.className = "status-box warning";
+            connBox.innerText = "در حال اتصال به سرور مقابل...";
+
+            fetch('/api/ping-remote', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({remote_token: remoteToken})
+            })
+            .then(async res => {
+                if (!res.ok) throw new Error(await res.text());
+                return res.json();
+            })
+            .then(data => {
+                connBox.className = "status-box success";
+                connBox.innerText = "✅ ارتباط با موفقیت برقرار شد! سرور مقابل آنلاین و آماده است.";
+            })
+            .catch(err => {
+                connBox.className = "status-box failure";
+                connBox.innerText = "❌ خطا در اتصال به سرور مقابل: " + err.message;
+            });
+        }
+
         function runTest() {
             let target = document.getElementById('target_ip').value.trim();
             let spoof = document.getElementById('spoof_ip').value.trim();
             let remoteToken = document.getElementById('remote_token').value.trim();
-            if(!target) { alert('لطفا IP مقصد یا توکن سرور دوم را وارد کنید'); return; }
+            if(!target) { alert('لطفا IP مقصد را وارد کنید'); return; }
             
             let btn = document.getElementById('run_btn');
-            let term = document.getElementById('terminal');
             let resBox = document.getElementById('status_result');
             
             btn.disabled = true;
-            btn.innerText = "در حال مذاکره با سرور دوم و ارسال پکت‌ها...";
+            btn.innerText = "در حال اجرای تست و هماهنگی دوطرفه...";
             resBox.className = "";
             resBox.innerText = "";
-            term.innerText = "[+] Initiating Spoof Test...\n";
             
             fetch('/api/test', {
                 method: 'POST',
@@ -160,9 +231,7 @@ const htmlPage = `
                 return res.json();
             })
             .then(data => {
-                term.innerText += data.log + "\n";
-                term.scrollTop = term.scrollHeight;
-
+                let resBox = document.getElementById('status_result');
                 if (data.remote_verified) {
                     if (data.remote_received > 0) {
                         resBox.className = "status-box success";
@@ -177,7 +246,7 @@ const htmlPage = `
                 } else {
                     if (data.local_success) {
                         resBox.className = "status-box warning";
-                        resBox.innerText = "⚠️ ارسال محلی موفق (بدون سرور دوم): پکت‌ها در iptables تغییر یافتند، اما برای اطمینان ۱۰۰٪ از عبور از دیتاسنتر، توکن سرور دوم را وارد کنید.";
+                        resBox.innerText = "⚠️ ارسال محلی موفق (بدون سرور دوم): پکت‌ها تغییر یافتند، اما برای تایید ۱۰۰٪، توکن سرور دوم را متصل کنید.";
                     } else {
                         resBox.className = "status-box failure";
                         resBox.innerText = "❌ عدم موفقیت در اعمال قوانین محلی.";
@@ -185,7 +254,6 @@ const htmlPage = `
                 }
             })
             .catch(err => {
-                term.innerText += "[-] Error: " + err.message + "\n";
                 resBox.className = "status-box failure";
                 resBox.innerText = "خطا: " + err.message;
             })
@@ -199,7 +267,10 @@ const htmlPage = `
 </html>
 `
 
-var tmpl = template.Must(template.New("index").Parse(htmlPage))
+var (
+	tmpl           = template.Must(template.New("index").Parse(htmlPage))
+	isCurrentlyListening bool
+)
 
 func generateToken() string {
 	b := make([]byte, 8)
@@ -245,15 +316,29 @@ func isValidIPv4(ipStr string) bool {
 }
 
 func listenForSpoofedICMP(expectedIP string, duration time.Duration) (int, string) {
+	mu.Lock()
+	isCurrentlyListening = true
+	mu.Unlock()
+
+	defer func() {
+		mu.Lock()
+		isCurrentlyListening = false
+		mu.Unlock()
+	}()
+
 	var logB strings.Builder
 	conn, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
-		return 0, fmt.Sprintf("[-] Raw ICMP socket error (is app running as root?): %v\n", err)
+		errMsg := fmt.Sprintf("[-] Raw ICMP socket error (Run app as root!): %v", err)
+		addLiveLog(errMsg)
+		return 0, errMsg
 	}
 	defer conn.Close()
 
 	conn.SetReadDeadline(time.Now().Add(duration))
-	logB.WriteString(fmt.Sprintf("[Remote Receiver] Listening on ip4:icmp for source %s (%v)...\n", expectedIP, duration))
+	msg := fmt.Sprintf("🔴 [Receiver] Started listening on ip4:icmp for spoofed source: %s (Duration: %v)", expectedIP, duration)
+	addLiveLog(msg)
+	logB.WriteString(msg + "\n")
 
 	count := 0
 	buf := make([]byte, 1500)
@@ -263,14 +348,70 @@ func listenForSpoofedICMP(expectedIP string, duration time.Duration) (int, strin
 			break
 		}
 		if n > 0 && addr.String() == expectedIP {
-			if buf[0] == 8 {
+			if buf[0] == 8 { // ICMP Echo Request
 				count++
-				logB.WriteString(fmt.Sprintf("[Remote Receiver] 🎯 CAPTURED ICMP Echo Request #%d from spoofed IP %s (%d bytes)\n", count, addr.String(), n))
+				packetMsg := fmt.Sprintf("🎯 [Receiver] SUCCESS! Captured ICMP Echo Request #%d from Spoofed IP: %s (%d bytes)", count, addr.String(), n)
+				addLiveLog(packetMsg)
+				logB.WriteString(packetMsg + "\n")
 			}
 		}
 	}
-	logB.WriteString(fmt.Sprintf("[Remote Receiver] Listener finished. Total spoofed packets received: %d\n", count))
+	finishMsg := fmt.Sprintf("🏁 [Receiver] Listener closed. Total captured packets from %s: %d", expectedIP, count)
+	addLiveLog(finishMsg)
+	logB.WriteString(finishMsg + "\n")
 	return count, logB.String()
+}
+
+func handleLogs(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs":          liveLogs,
+		"is_listening":  isCurrentlyListening,
+	})
+}
+
+func handlePingRemote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		RemoteToken string `json:"remote_token"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	parts := strings.SplitN(strings.TrimSpace(req.RemoteToken), "|", 2)
+	if len(parts) != 2 {
+		http.Error(w, "فرمت توکن نامعتبر است", http.StatusBadRequest)
+		return
+	}
+	remoteAddr, remoteSecret := parts[0], parts[1]
+
+	httpReq, err := http.NewRequest("POST", fmt.Sprintf("http://%s/api/listen", remoteAddr), bytes.NewBuffer([]byte(`{"expected_source_ip":"1.1.1.1","duration_sec":1}`)))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Spoof-Token", remoteSecret)
+
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		http.Error(w, "عدم توانایی در ارتباط با سرور مقابل: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "توکن یا احراز هویت نامعتبر است", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"connected"}`))
 }
 
 func handleListen(w http.ResponseWriter, r *http.Request) {
@@ -340,7 +481,7 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 
 	var logBuilder strings.Builder
 	iface := getDefaultInterface()
-	logBuilder.WriteString(fmt.Sprintf("[Local Sender] Interface: %s | Target: %s | Spoof: %s\n", iface, req.TargetIP, req.SpoofIP))
+	addLiveLog(fmt.Sprintf("[Sender] Starting test -> Target: %s | Spoof: %s", req.TargetIP, req.SpoofIP))
 
 	var wg sync.WaitGroup
 	var remoteResp ListenResponse
@@ -350,13 +491,13 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 	if req.RemoteToken != "" {
 		parts := strings.SplitN(req.RemoteToken, "|", 2)
 		if len(parts) != 2 {
-			http.Error(w, "فرمت توکن سرور دوم نامعتبر است (فرمت صحیح: IP:PORT|TOKEN)", http.StatusBadRequest)
+			http.Error(w, "فرمت توکن نامعتبر است", http.StatusBadRequest)
 			return
 		}
 		remoteAddr, remoteSecret := parts[0], parts[1]
 		remoteVerified = true
 
-		logBuilder.WriteString(fmt.Sprintf("[+] Connecting to Remote Server (%s) to start packet sniffer...\n", remoteAddr))
+		addLiveLog(fmt.Sprintf("[Sender] Contacting remote server at %s to activate listener...", remoteAddr))
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -388,13 +529,13 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 			json.NewDecoder(resp.Body).Decode(&remoteResp)
 		}()
 
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond) // Give remote server time to bind raw socket
 	}
 
 	ruleArgs := []string{"-t", "nat", "-A", "POSTROUTING", "-o", iface, "-d", req.TargetIP, "-p", "icmp", "-j", "SNAT", "--to-source", req.SpoofIP}
-	logBuilder.WriteString(fmt.Sprintf("[Local Sender] Adding SNAT Rule: iptables %s\n", strings.Join(ruleArgs, " ")))
+	addLiveLog(fmt.Sprintf("[Sender] Applying iptables SNAT rule for %s...", req.SpoofIP))
 	if out, err := exec.Command("iptables", ruleArgs...).CombinedOutput(); err != nil {
-		logBuilder.WriteString(fmt.Sprintf("[-] iptables error: %v\n%s\n", err, string(out)))
+		addLiveLog(fmt.Sprintf("[-] iptables error: %v", err))
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(TestResponse{Log: logBuilder.String(), LocalSuccess: false})
 		return
@@ -405,13 +546,12 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 		exec.Command("iptables", delArgs...).Run()
 	}()
 
-	logBuilder.WriteString(fmt.Sprintf("[Local Sender] Sending 3 spoofed ICMP packets to %s...\n", req.TargetIP))
+	addLiveLog(fmt.Sprintf("[Sender] Sending 3 ICMP pings to %s...", req.TargetIP))
 	pingOut, _ := exec.Command("ping", "-c", "3", "-i", "0.5", "-W", "1", req.TargetIP).CombinedOutput()
-	logBuilder.WriteString(string(pingOut))
+	addLiveLog(string(pingOut))
 
 	statOut, err := exec.Command("iptables", "-t", "nat", "-L", "POSTROUTING", "-v", "-n", "-x").CombinedOutput()
 	statStr := string(statOut)
-	logBuilder.WriteString("\n--- Local iptables POSTROUTING Counters ---\n" + statStr)
 
 	localSuccess := false
 	if err == nil {
@@ -428,16 +568,15 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 
 	if remoteVerified {
 		wg.Wait()
-		logBuilder.WriteString("\n--- Remote Server Verification Report ---\n")
 		if remoteErr != nil {
-			logBuilder.WriteString(fmt.Sprintf("[-] Failed to verify with Remote Server: %v\n", remoteErr))
+			addLiveLog(fmt.Sprintf("[-] Remote verification failed: %v", remoteErr))
 			remoteVerified = false
 		} else {
-			logBuilder.WriteString(remoteResp.Log)
+			addLiveLog("[Sender] Remote verification report received successfully.")
 		}
 	}
 
-	logBuilder.WriteString("\n[+] Cleaned up temporary iptables SNAT rule.")
+	addLiveLog("[Sender] Test finished. Cleaning up iptables rule.")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(TestResponse{
@@ -456,6 +595,10 @@ func main() {
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/test", handleTest)
 	http.HandleFunc("/api/listen", handleListen)
+	http.HandleFunc("/api/logs", handleLogs)
+	http.HandleFunc("/api/ping-remote", handlePingRemote)
+
+	addLiveLog("Server started successfully.")
 
 	fmt.Println("==================================================")
 	fmt.Printf("🚀 Two-Way Spoof Analyzer is running!\n")
