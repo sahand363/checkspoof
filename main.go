@@ -244,7 +244,6 @@ func isValidIPv4(ipStr string) bool {
 	return ip != nil && ip.To4() != nil
 }
 
-// listenForSpoofedICMP listens on a raw ICMP socket for incoming packets matching sourceIP
 func listenForSpoofedICMP(expectedIP string, duration time.Duration) (int, string) {
 	var logB strings.Builder
 	conn, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
@@ -261,10 +260,9 @@ func listenForSpoofedICMP(expectedIP string, duration time.Duration) (int, strin
 	for {
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
-			break // Deadline reached or socket closed
+			break
 		}
 		if n > 0 && addr.String() == expectedIP {
-			// ICMP Type 8 = Echo Request
 			if buf[0] == 8 {
 				count++
 				logB.WriteString(fmt.Sprintf("[Remote Receiver] 🎯 CAPTURED ICMP Echo Request #%d from spoofed IP %s (%d bytes)\n", count, addr.String(), n))
@@ -275,7 +273,6 @@ func listenForSpoofedICMP(expectedIP string, duration time.Duration) (int, strin
 	return count, logB.String()
 }
 
-// handleListen is called by the first server on the second server to verify packet arrival
 func handleListen(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -345,7 +342,128 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 	iface := getDefaultInterface()
 	logBuilder.WriteString(fmt.Sprintf("[Local Sender] Interface: %s | Target: %s | Spoof: %s\n", iface, req.TargetIP, req.SpoofIP))
 
-	// Optional: Coordinate with Remote Server if token is provided
 	var wg sync.WaitGroup
 	var remoteResp ListenResponse
 	var remoteErr error
+	remoteVerified := false
+
+	if req.RemoteToken != "" {
+		parts := strings.SplitN(req.RemoteToken, "|", 2)
+		if len(parts) != 2 {
+			http.Error(w, "فرمت توکن سرور دوم نامعتبر است (فرمت صحیح: IP:PORT|TOKEN)", http.StatusBadRequest)
+			return
+		}
+		remoteAddr, remoteSecret := parts[0], parts[1]
+		remoteVerified = true
+
+		logBuilder.WriteString(fmt.Sprintf("[+] Connecting to Remote Server (%s) to start packet sniffer...\n", remoteAddr))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			payload, _ := json.Marshal(ListenRequest{
+				ExpectedSourceIP: req.SpoofIP,
+				DurationSec:      4,
+			})
+			httpReq, err := http.NewRequest("POST", fmt.Sprintf("http://%s/api/listen", remoteAddr), bytes.NewBuffer(payload))
+			if err != nil {
+				remoteErr = err
+				return
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("X-Spoof-Token", remoteSecret)
+
+			client := http.Client{Timeout: 7 * time.Second}
+			resp, err := client.Do(httpReq)
+			if err != nil {
+				remoteErr = err
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				remoteErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+				return
+			}
+			json.NewDecoder(resp.Body).Decode(&remoteResp)
+		}()
+
+		time.Sleep(400 * time.Millisecond)
+	}
+
+	ruleArgs := []string{"-t", "nat", "-A", "POSTROUTING", "-o", iface, "-d", req.TargetIP, "-p", "icmp", "-j", "SNAT", "--to-source", req.SpoofIP}
+	logBuilder.WriteString(fmt.Sprintf("[Local Sender] Adding SNAT Rule: iptables %s\n", strings.Join(ruleArgs, " ")))
+	if out, err := exec.Command("iptables", ruleArgs...).CombinedOutput(); err != nil {
+		logBuilder.WriteString(fmt.Sprintf("[-] iptables error: %v\n%s\n", err, string(out)))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TestResponse{Log: logBuilder.String(), LocalSuccess: false})
+		return
+	}
+
+	defer func() {
+		delArgs := []string{"-t", "nat", "-D", "POSTROUTING", "-o", iface, "-d", req.TargetIP, "-p", "icmp", "-j", "SNAT", "--to-source", req.SpoofIP}
+		exec.Command("iptables", delArgs...).Run()
+	}()
+
+	logBuilder.WriteString(fmt.Sprintf("[Local Sender] Sending 3 spoofed ICMP packets to %s...\n", req.TargetIP))
+	pingOut, _ := exec.Command("ping", "-c", "3", "-i", "0.5", "-W", "1", req.TargetIP).CombinedOutput()
+	logBuilder.WriteString(string(pingOut))
+
+	statOut, err := exec.Command("iptables", "-t", "nat", "-L", "POSTROUTING", "-v", "-n", "-x").CombinedOutput()
+	statStr := string(statOut)
+	logBuilder.WriteString("\n--- Local iptables POSTROUTING Counters ---\n" + statStr)
+
+	localSuccess := false
+	if err == nil {
+		for _, line := range strings.Split(statStr, "\n") {
+			if strings.Contains(line, req.TargetIP) && strings.Contains(line, "to:"+req.SpoofIP) {
+				fields := strings.Fields(line)
+				if len(fields) > 0 && fields[0] != "0" {
+					localSuccess = true
+					break
+				}
+			}
+		}
+	}
+
+	if remoteVerified {
+		wg.Wait()
+		logBuilder.WriteString("\n--- Remote Server Verification Report ---\n")
+		if remoteErr != nil {
+			logBuilder.WriteString(fmt.Sprintf("[-] Failed to verify with Remote Server: %v\n", remoteErr))
+			remoteVerified = false
+		} else {
+			logBuilder.WriteString(remoteResp.Log)
+		}
+	}
+
+	logBuilder.WriteString("\n[+] Cleaned up temporary iptables SNAT rule.")
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(TestResponse{
+		Log:            logBuilder.String(),
+		LocalSuccess:   localSuccess,
+		RemoteVerified: remoteVerified,
+		RemoteReceived: remoteResp.ReceivedCount,
+	})
+}
+
+func main() {
+	serverIP = getOutboundIP()
+	authToken = generateToken()
+	connectionCode := fmt.Sprintf("%s:%s|%s", serverIP, port, authToken)
+
+	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/api/test", handleTest)
+	http.HandleFunc("/api/listen", handleListen)
+
+	fmt.Println("==================================================")
+	fmt.Printf("🚀 Two-Way Spoof Analyzer is running!\n")
+	fmt.Printf("🌐 Web UI Address   : http://%s:%s\n", serverIP, port)
+	fmt.Printf("🔑 Connection Token : %s\n", connectionCode)
+	fmt.Println("==================================================")
+
+	if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
+		fmt.Printf("[-] Server error: %v\n", err)
+	}
+}
