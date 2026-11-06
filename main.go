@@ -17,11 +17,12 @@ import (
 )
 
 var (
-	serverIP    string
-	authToken   string
-	port        = "5000"
-	mu          sync.Mutex
-	liveLogs    []string
+	serverIP             string
+	authToken            string
+	port                 = "5000"
+	mu                   sync.Mutex
+	liveLogs             []string
+	isCurrentlyListening bool
 )
 
 func addLiveLog(msg string) {
@@ -99,7 +100,7 @@ const htmlPage = `
 </head>
 <body>
     <div class="container">
-        <h1>ابزار تحلیل دوطرفه IP Spoofing</h1>
+        <h1>ابزار دوطرفه تحلیل IP Spoofing</h1>
         <div class="server-info">
             آدرس این سرور: <span>{{.ServerIP}}:5000</span> | اینترفیس شبکه: <span>{{.Iface}}</span>
         </div>
@@ -157,7 +158,6 @@ const htmlPage = `
             }
         }
 
-        // Poll logs from the server every 1.5 seconds so both sender and receiver see activity live
         setInterval(() => {
             fetch('/api/logs')
             .then(res => res.json())
@@ -267,10 +267,7 @@ const htmlPage = `
 </html>
 `
 
-var (
-	tmpl           = template.Must(template.New("index").Parse(htmlPage))
-	isCurrentlyListening bool
-)
+var tmpl = template.Must(template.New("index").Parse(htmlPage))
 
 func generateToken() string {
 	b := make([]byte, 8)
@@ -348,7 +345,7 @@ func listenForSpoofedICMP(expectedIP string, duration time.Duration) (int, strin
 			break
 		}
 		if n > 0 && addr.String() == expectedIP {
-			if buf[0] == 8 { // ICMP Echo Request
+			if buf[0] == 8 {
 				count++
 				packetMsg := fmt.Sprintf("🎯 [Receiver] SUCCESS! Captured ICMP Echo Request #%d from Spoofed IP: %s (%d bytes)", count, addr.String(), n)
 				addLiveLog(packetMsg)
@@ -367,8 +364,8 @@ func handleLogs(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"logs":          liveLogs,
-		"is_listening":  isCurrentlyListening,
+		"logs":         liveLogs,
+		"is_listening": isCurrentlyListening,
 	})
 }
 
@@ -529,7 +526,7 @@ func handleTest(w http.ResponseWriter, r *http.Request) {
 			json.NewDecoder(resp.Body).Decode(&remoteResp)
 		}()
 
-		time.Sleep(400 * time.Millisecond) // Give remote server time to bind raw socket
+		time.Sleep(400 * time.Millisecond)
 	}
 
 	ruleArgs := []string{"-t", "nat", "-A", "POSTROUTING", "-o", iface, "-d", req.TargetIP, "-p", "icmp", "-j", "SNAT", "--to-source", req.SpoofIP}
