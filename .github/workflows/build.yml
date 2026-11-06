@@ -7,6 +7,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -18,10 +20,13 @@ jobs:
 
       - name: Build Binary
         run: |
-          go build -o checkspoof main.go
+          go build -v -o checkspoof main.go
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Release Binary
+        uses: softprops/action-gh-release@v2
         with:
-          name: checkspoof-binary
-          path: checkspoof
+          tag_name: v1.0.${{ github.run_number }}
+          name: CheckSpoof Release v1.0.${{ github.run_number }}
+          files: checkspoof
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
