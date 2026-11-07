@@ -1,4 +1,4 @@
-name: Build and Release CheckSpoof
+name: Build, Test, and Release CheckSpoof
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    name: Build Linux Binary
+    name: Verify, Test & Build on Linux
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -20,15 +20,27 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Compile Binary
+      - name: Check Go Formatting (gofmt)
+        run: |
+          test -z "$(gofmt -l .)"
+
+      - name: Run Static Analysis (go vet)
+        run: |
+          go vet ./...
+
+      - name: Run Automated Unit & Integration Tests (go test)
+        run: |
+          go test -v -race ./...
+
+      - name: Build Production Binary
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o checkspoof main.go
 
       - name: Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.1.${{ github.run_number }}
-          name: CheckSpoof Release v1.1.${{ github.run_number }}
+          tag_name: v2.0.${{ github.run_number }}
+          name: CheckSpoof Enterprise v2.0.${{ github.run_number }}
           files: checkspoof
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
