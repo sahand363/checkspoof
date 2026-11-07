@@ -1,12 +1,9 @@
-Run the automated installation one-liner on Server A and Server B:
+Option A — Specify your desired port directly in the one-liner (e.g., port 8085 or 9090):
 Bash
 
-curl -sSL https://raw.githubusercontent.com/sahand363/checkspoof/main/install.sh | bash && sudo checkspoof
+curl -sSL https://raw.githubusercontent.com/sahand363/checkspoof/main/install.sh | bash && sudo checkspoof -port 8085
 
-Step 2: Access Dashboards
+Option B — Interactive Mode (asks you for the port on startup):
+Bash
 
-Open your browser and navigate to:
-
-    Server A Dashboard: http://<SERVER_A_IP>:5000
-
-    Server B Dashboard: http://<SERVER_B_IP>:5000
+curl -sSL https://raw.githubusercontent.com/sahand363/checkspoof/main/install.sh | bash && sudo c
