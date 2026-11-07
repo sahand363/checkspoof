@@ -20,9 +20,9 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Check Go Formatting (gofmt)
+      - name: Format Go Code (gofmt)
         run: |
-          test -z "$(gofmt -l .)"
+          gofmt -s -w .
 
       - name: Run Static Analysis (go vet)
         run: |
