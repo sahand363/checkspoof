@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -22,7 +23,7 @@ type MockCommandCall struct {
 type MockCommandRunner struct {
 	mu          sync.Mutex
 	Calls       []MockCommandCall
-	CounterPkts int
+	LastSpoofIP string
 	RouteFail   bool
 	PermFail    bool
 }
@@ -31,6 +32,12 @@ func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.Calls = append(m.Calls, MockCommandCall{Name: name, Args: args})
+
+	for i, arg := range args {
+		if arg == "--to-source" && i+1 < len(args) {
+			m.LastSpoofIP = args[i+1]
+		}
+	}
 
 	cmdLine := name + " " + strings.Join(args, " ")
 	if name == "ip" && strings.Contains(cmdLine, "route get") {
@@ -45,9 +52,13 @@ func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) 
 			return []byte("iptables: Permission denied (you must be root)."), 4, context.DeadlineExceeded
 		}
 		if strings.Contains(cmdLine, "-L CSPF_") {
-			out := "Chain CSPF_TEST (1 references)\n" +
-				"    pkts      bytes target     prot opt in     out     source               destination\n" +
-				"       3      252 SNAT       all  --  *      eth0    0.0.0.0/0            127.0.0.1            to:8.8.8.8\n"
+			spoof := m.LastSpoofIP
+			if spoof == "" {
+				spoof = "8.8.8.8"
+			}
+			out := fmt.Sprintf("Chain CSPF_TEST (1 references)\n"+
+				"    pkts      bytes target     prot opt in     out     source               destination\n"+
+				"       3      252 SNAT       all  --  *      eth0    0.0.0.0/0            127.0.0.1            to:%s\n", spoof)
 			return []byte(out), 0, nil
 		}
 		return []byte(""), 0, nil
@@ -212,6 +223,7 @@ func TestEndToEndTwoServerReadinessAndUDPVerification(t *testing.T) {
 	if err != nil || respEarly.StatusCode != http.StatusPreconditionFailed {
 		t.Fatalf("expected 412 Precondition Failed before readiness, got %v", respEarly)
 	}
+	_ = respEarly.Body.Close()
 
 	// Step 2: Pair Server A with Server B using Server B's pairing token over TLS 1.3
 	tokenB := srvB.PairingToken()
@@ -222,10 +234,14 @@ func TestEndToEndTwoServerReadinessAndUDPVerification(t *testing.T) {
 	if err != nil || respPair.StatusCode != http.StatusOK {
 		t.Fatalf("pairing failed: err=%v, status=%v", err, respPair)
 	}
+	_ = respPair.Body.Close()
 
 	// Verify pairing did NOT start receiver listener prematurely
-	if srvB.LocalReceiverState != RecvIdle {
-		t.Fatalf("expected Server B receiver state to remain IDLE after pairing, got %s", srvB.LocalReceiverState)
+	srvB.mu.RLock()
+	initialRecvState := srvB.LocalReceiverState
+	srvB.mu.RUnlock()
+	if initialRecvState != RecvIdle {
+		t.Fatalf("expected Server B receiver state to remain IDLE after pairing, got %s", initialRecvState)
 	}
 
 	// Step 3: Prepare Receiver on Server B (expecting loopback source 127.0.0.1 for local test)
@@ -240,6 +256,7 @@ func TestEndToEndTwoServerReadinessAndUDPVerification(t *testing.T) {
 	if err != nil || respPrep.StatusCode != http.StatusOK {
 		t.Fatalf("prepare receiver failed: err=%v, status=%v", err, respPrep)
 	}
+	_ = respPrep.Body.Close()
 
 	// Verify Server B is now genuinely READY_TO_RECEIVE and holding the UDP listener open
 	srvB.mu.RLock()
@@ -256,6 +273,7 @@ func TestEndToEndTwoServerReadinessAndUDPVerification(t *testing.T) {
 	if err != nil || respRun.StatusCode != http.StatusOK {
 		t.Fatalf("test execution failed: err=%v, status=%v", err, respRun)
 	}
+	defer respRun.Body.Close()
 
 	var testRes AdminTestResult
 	if err := json.NewDecoder(respRun.Body).Decode(&testRes); err != nil {
