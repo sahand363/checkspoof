@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ type MockCommandRunner struct {
 	LastSpoofIP string
 	RouteFail   bool
 	PermFail    bool
+	RouteTable  map[string]string
 }
 
 func (m *MockCommandRunner) IsMock() bool {
@@ -50,7 +52,19 @@ func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) 
 		if m.RouteFail {
 			return []byte("RTNETLINK answers: Network is unreachable"), 2, nil
 		}
-		return []byte("127.0.0.1 via 10.0.0.1 dev eth0 src 10.0.0.15 uid 0"), 0, nil
+		target := ""
+		if len(args) >= 3 {
+			target = args[2]
+		}
+		if m.RouteTable != nil {
+			if customOut, ok := m.RouteTable[target]; ok {
+				return []byte(customOut), 0, nil
+			}
+		}
+		if target == "" {
+			target = "127.0.0.1"
+		}
+		return []byte(fmt.Sprintf("%s via 10.0.0.1 dev eth0 src 10.0.0.15 uid 0", target)), 0, nil
 	}
 
 	if name == "iptables" {
@@ -335,13 +349,11 @@ func TestLocalControlFlowAndPacketFraming_LoopbackMocked_DoesNotClaimSpoofSucces
 		t.Fatal(err)
 	}
 
-	// Verify separated stage flags
 	if !testRes.ReceiverListenerReady || !testRes.SNATRuleInstalled || !testRes.LocalPacketGenSuccess {
 		t.Fatalf("expected local & readiness stages to succeed, got ready=%v, snat=%v, localGen=%v",
 			testRes.ReceiverListenerReady, testRes.SNATRuleInstalled, testRes.LocalPacketGenSuccess)
 	}
 
-	// CRITICAL ASSERTION: Loopback/mocked execution must NEVER report SPOOF_SUCCESS or RemoteSpoofVerified=true
 	if testRes.PrimaryClassification == ClassSpoofSuccess || testRes.RemoteSpoofVerified {
 		t.Fatalf("SECURITY/VERIFICATION BUG: loopback or mocked test falsely reported SPOOF_SUCCESS! got classification=%s, RemoteSpoofVerified=%v",
 			testRes.PrimaryClassification, testRes.RemoteSpoofVerified)
@@ -352,9 +364,8 @@ func TestLocalControlFlowAndPacketFraming_LoopbackMocked_DoesNotClaimSpoofSucces
 	}
 }
 
-// 5. Test Genuine Spoof Setup Guard (Rejects Loopback, Mock Runner, and Unspoofed Sender IP)
+// 5. Test Genuine Spoof Setup Guard (Rejects Loopback, Mock Runner, LocalOutboundIP, and PublicIP)
 func TestGenuineSpoofSetupGuard(t *testing.T) {
-	// Case 1: Mock runner must always be rejected for SPOOF_SUCCESS
 	srvMock, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
 		t.Fatal(err)
@@ -364,32 +375,240 @@ func TestGenuineSpoofSetupGuard(t *testing.T) {
 		t.Fatal("expected MockCommandRunner to be rejected as non-genuine network spoof setup")
 	}
 
-	// Case 2: Real runner, but loopback target or spoof IP must be rejected
 	srvReal, err := NewAppServer(&RealCommandRunner{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	srvReal.LocalOutboundIP = "10.0.0.15"
+	srvReal.PublicIP = "198.51.100.10"
 	srvReal.ServerIP = "198.51.100.10"
+
 	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("127.0.0.1", "8.8.8.8"); ok {
 		t.Fatal("expected loopback target 127.0.0.1 to be rejected")
 	}
 	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "127.0.0.1"); ok {
 		t.Fatal("expected loopback spoof IP 127.0.0.1 to be rejected")
 	}
-
-	// Case 3: Real runner, non-loopback, but SpoofIP == SenderIP (no actual spoofing) must be rejected
 	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "198.51.100.10"); ok {
-		t.Fatal("expected unspoofed IP (SpoofIP == SenderIP) to be rejected")
+		t.Fatal("expected unspoofed IP matching sender PublicIP to be rejected")
+	}
+	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "10.0.0.15"); ok {
+		t.Fatal("expected unspoofed IP matching sender LocalOutboundIP to be rejected")
+	}
+	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "172.16.0.9", "172.16.0.9"); ok {
+		t.Fatal("expected unspoofed IP matching route source IP to be rejected")
 	}
 
-	// Case 4: Real runner, distinct public SenderIP, TargetIP, and SpoofIP -> valid genuine setup
-	if ok, reason := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "8.8.8.8"); !ok {
+	if ok, reason := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "8.8.8.8", "10.0.0.15"); !ok {
 		t.Fatalf("expected valid two-VPS setup to pass guard, got rejection: %s", reason)
 	}
 }
 
-// 6. Real Two-Server VPS Integration Test Mode
-// Executes only when CHECKSPOOF_PEER_TOKEN is provided on an authorized Linux VPS.
+// 6. Test Route Selection & `ip route get` Parsing (Outgoing Interface + Source IP)
+func TestParseIPRouteGetOutput_AndDestinationRouteSelection(t *testing.T) {
+	cases := []struct {
+		name     string
+		raw      string
+		wantDev  string
+		wantSrc  string
+		wantGW   string
+		wantDest string
+		wantErr  bool
+	}{
+		{
+			name:     "Standard NAT gateway route",
+			raw:      "8.8.8.8 via 10.0.0.1 dev eth0 src 10.0.0.15 uid 0 \n    cache",
+			wantDev:  "eth0",
+			wantSrc:  "10.0.0.15",
+			wantGW:   "10.0.0.1",
+			wantDest: "8.8.8.8",
+		},
+		{
+			name:     "Direct subnet route without gateway",
+			raw:      "192.168.50.20 dev ens160 src 192.168.50.5 uid 0",
+			wantDev:  "ens160",
+			wantSrc:  "192.168.50.5",
+			wantGW:   "",
+			wantDest: "192.168.50.20",
+		},
+		{
+			name:     "Policy routing table with WireGuard interface",
+			raw:      "203.0.113.88 via 10.99.0.1 dev wg0 table 51820 src 10.99.0.2 uid 0",
+			wantDev:  "wg0",
+			wantSrc:  "10.99.0.2",
+			wantGW:   "10.99.0.1",
+			wantDest: "203.0.113.88",
+		},
+		{
+			name:    "Missing src address must fail",
+			raw:     "8.8.8.8 via 10.0.0.1 dev eth0",
+			wantErr: true,
+		},
+		{
+			name:    "Missing dev interface must fail",
+			raw:     "RTNETLINK answers: Network is unreachable",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := ParseIPRouteGetOutput(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for input %q, got %+v", tc.raw, info)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if info.Interface != tc.wantDev || info.SourceIP != tc.wantSrc || info.Gateway != tc.wantGW || info.Destination != tc.wantDest {
+				t.Fatalf("mismatch: got %+v, want dev=%s src=%s gw=%s dest=%s",
+					info, tc.wantDev, tc.wantSrc, tc.wantGW, tc.wantDest)
+			}
+		})
+	}
+
+	// Destination-specific route selection on a multi-interface server
+	mockRunner := &MockCommandRunner{
+		RouteTable: map[string]string{
+			"8.8.8.8":      "8.8.8.8 via 10.0.0.1 dev eth0 src 10.0.0.15 uid 0",
+			"203.0.113.99": "203.0.113.99 via 172.16.0.1 dev ens192 src 172.16.0.44 uid 0",
+		},
+	}
+	srv, err := NewAppServer(mockRunner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rInfo, err := srv.ResolveRoute(context.Background(), "203.0.113.99")
+	if err != nil {
+		t.Fatalf("ResolveRoute failed: %v", err)
+	}
+	if rInfo.Interface != "ens192" || rInfo.SourceIP != "172.16.0.44" {
+		t.Fatalf("expected destination route dev=ens192 src=172.16.0.44, got %+v", rInfo)
+	}
+}
+
+// 7. Test Private, CGNAT, Loopback, and Public IPv4 Classification
+func TestPrivateAndReservedIPv4Classification(t *testing.T) {
+	privateOrReserved := []string{
+		"127.0.0.1",
+		"10.0.0.15",
+		"172.16.0.1",
+		"172.31.255.254",
+		"192.168.1.10",
+		"100.64.0.1",
+		"100.127.255.254",
+		"169.254.10.20",
+		"0.0.0.0",
+		"255.255.255.255",
+		"not-an-ip",
+	}
+	for _, ip := range privateOrReserved {
+		if IsPublicRoutableIPv4(ip) {
+			t.Fatalf("expected %s to NOT be classified as a public routable IPv4", ip)
+		}
+	}
+
+	publicRoutable := []string{
+		"8.8.8.8",
+		"1.1.1.1",
+		"94.184.6.138",
+		"203.0.113.50",
+		"100.63.255.254",
+		"100.128.0.1",
+	}
+	for _, ip := range publicRoutable {
+		if !IsPublicRoutableIPv4(ip) {
+			t.Fatalf("expected %s to be classified as a public routable IPv4", ip)
+		}
+	}
+}
+
+// 8. Test Public IP Detection, NAT Separation, UNKNOWN Fallback, and Manual Public IP Configuration
+func TestPublicIPDetection_NAT_Unknown_AndManualOverride(t *testing.T) {
+	_ = os.Unsetenv("PUBLIC_IP")
+
+	// Scenario A: Behind NAT (LocalOutboundIP = 10.0.0.15), no public IP discovery run yet.
+	// Must never assume LocalOutboundIP (10.0.0.15) is the PublicIP!
+	srv, err := NewAppServer(&MockCommandRunner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.LocalOutboundIP != "10.0.0.15" || srv.LocalInterface != "eth0" {
+		t.Fatalf("expected LocalOutboundIP=10.0.0.15 on eth0, got %s on %s", srv.LocalOutboundIP, srv.LocalInterface)
+	}
+	if srv.PublicIP != IPValueUnknown || srv.PublicIPSource != PublicIPSourceNone {
+		t.Fatalf("expected PublicIP=UNKNOWN when not discovered, got %s (%s)", srv.PublicIP, srv.PublicIPSource)
+	}
+	if !srv.BehindNAT {
+		t.Fatal("expected BehindNAT=true when LocalOutboundIP is RFC1918 10.0.0.15")
+	}
+
+	// Scenario B: Discovery endpoints return conflicting public IPs -> uncertain -> must report UNKNOWN
+	ep1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.10\n"))
+	}))
+	defer ep1.Close()
+	ep2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("198.51.100.22\n"))
+	}))
+	defer ep2.Close()
+
+	srv.PublicIPEndpoints = []string{ep1.URL, ep2.URL}
+	srv.PublicIPHTTP = ep1.Client()
+	gotIP, err := srv.DiscoverAndSetPublicIP(context.Background())
+	if err == nil || gotIP != IPValueUnknown || srv.PublicIP != IPValueUnknown {
+		t.Fatalf("expected conflicting discovery responses to report UNKNOWN, got ip=%s, srv.PublicIP=%s, err=%v",
+			gotIP, srv.PublicIP, err)
+	}
+
+	// Scenario C: Discovery endpoint returns a private RFC1918 IP -> must reject and report UNKNOWN
+	epPrivate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("192.168.1.250"))
+	}))
+	defer epPrivate.Close()
+	srv.PublicIPEndpoints = []string{epPrivate.URL}
+	gotIP, err = srv.DiscoverAndSetPublicIP(context.Background())
+	if err == nil || gotIP != IPValueUnknown || srv.PublicIP != IPValueUnknown {
+		t.Fatalf("expected private IP from discovery endpoint to be rejected as UNKNOWN, got %s (err=%v)", gotIP, err)
+	}
+
+	// Scenario D: Discovery endpoints agree on a valid public IP -> LocalOutboundIP stays 10.0.0.15, PublicIP becomes 203.0.113.10
+	epConsistent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.10\n"))
+	}))
+	defer epConsistent.Close()
+	srv.PublicIPEndpoints = []string{ep1.URL, epConsistent.URL}
+	gotIP, err = srv.DiscoverAndSetPublicIP(context.Background())
+	if err != nil || gotIP != "203.0.113.10" {
+		t.Fatalf("expected discovered public IP 203.0.113.10, got %s (err=%v)", gotIP, err)
+	}
+	if srv.LocalOutboundIP != "10.0.0.15" || srv.PublicIP != "203.0.113.10" || srv.PublicIPSource != PublicIPDiscovered || !srv.BehindNAT {
+		t.Fatalf("unexpected NAT state after discovery: local=%s, public=%s (%s), behindNAT=%v",
+			srv.LocalOutboundIP, srv.PublicIP, srv.PublicIPSource, srv.BehindNAT)
+	}
+
+	// Scenario E: Manual Public IP configuration rejects private/loopback IPs and accepts valid public IPs
+	if err := srv.SetManualPublicIP("10.0.0.99"); err == nil {
+		t.Fatal("expected SetManualPublicIP to reject private RFC1918 IP 10.0.0.99")
+	}
+	if err := srv.SetManualPublicIP("127.0.0.1"); err == nil {
+		t.Fatal("expected SetManualPublicIP to reject loopback IP 127.0.0.1")
+	}
+	if err := srv.SetManualPublicIP("94.184.6.138"); err != nil {
+		t.Fatalf("expected SetManualPublicIP to accept valid public IP, got err=%v", err)
+	}
+	if srv.PublicIP != "94.184.6.138" || srv.PublicIPSource != PublicIPManual {
+		t.Fatalf("expected manual PublicIP=94.184.6.138 (MANUAL), got %s (%s)", srv.PublicIP, srv.PublicIPSource)
+	}
+	if !strings.HasPrefix(srv.PairingToken(), "94.184.6.138:") {
+		t.Fatalf("expected PairingToken to use configured PublicIP, got %s", srv.PairingToken())
+	}
+}
+
+// 9. Real Two-Server VPS Integration Test Mode
 func TestRealTwoServerVPSIntegration(t *testing.T) {
 	peerToken := strings.TrimSpace(os.Getenv("CHECKSPOOF_PEER_TOKEN"))
 	spoofIP := strings.TrimSpace(os.Getenv("CHECKSPOOF_SPOOF_IP"))
@@ -421,7 +640,7 @@ func TestRealTwoServerVPSIntegration(t *testing.T) {
 	}
 
 	t.Logf("Stage 1 [ReceiverListenerReady] : %v", res.ReceiverListenerReady)
-	t.Logf("Stage 2 [SNATRuleInstalled]     : %v (Chain=%s, Iface=%s)", res.SNATRuleInstalled, res.IsolatedChainName, res.OutgoingInterface)
+	t.Logf("Stage 2 [SNATRuleInstalled]     : %v (Chain=%s, Iface=%s, Src=%s)", res.SNATRuleInstalled, res.IsolatedChainName, res.OutgoingInterface, res.OutgoingSourceIP)
 	t.Logf("Stage 3 [LocalPacketGenSuccess] : %v (%d/%d sent)", res.LocalPacketGenSuccess, res.PacketsSent, res.PacketsAttempted)
 	t.Logf("Stage 4 [SNATPacketsMatched]    : %d pkts (%d bytes)", res.SNATPacketsMatched, res.SNATBytesMatched)
 	t.Logf("Stage 5 [RemoteSpoofVerified]   : %v (%d verified packets arriving with source IP %s)", res.RemoteSpoofVerified, res.RemoteVerifiedCount, spoofIP)
@@ -435,7 +654,7 @@ func TestRealTwoServerVPSIntegration(t *testing.T) {
 	}
 }
 
-// 7. Regression Test (Case A): Replacing an active receiver session must not deadlock
+// 10. Regression Test (Case A): Replacing an active receiver session must not deadlock
 func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -524,7 +743,7 @@ func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 	}
 }
 
-// 8. Regression Test (Case B): Concurrent StartReceiverSession calls must serialize cleanly
+// 11. Regression Test (Case B): Concurrent StartReceiverSession calls must serialize cleanly
 func TestRegression_ConcurrentStartReceiverSession(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -621,7 +840,7 @@ func TestRegression_ConcurrentStartReceiverSession(t *testing.T) {
 	}
 }
 
-// 9. Regression Test (Case C): Cancelling a receiver session during listener startup
+// 12. Regression Test (Case C): Cancelling a receiver session during listener startup
 func TestRegression_CancelDuringStartup(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -714,7 +933,7 @@ func TestRegression_CancelDuringStartup(t *testing.T) {
 	}
 }
 
-// 10. Regression Test (Case D): Repeated concurrent cancellation during shutdown is idempotent
+// 13. Regression Test (Case D): Repeated concurrent cancellation during shutdown is idempotent
 func TestRegression_RepeatedCancellationDuringShutdown(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -782,7 +1001,7 @@ func TestRegression_RepeatedCancellationDuringShutdown(t *testing.T) {
 	}
 }
 
-// 11. Regression Test (Case E): Old session cleanup cannot overwrite newer session's state
+// 14. Regression Test (Case E): Old session cleanup cannot overwrite newer session's state
 func TestRegression_OldSessionCleanupCannotOverwriteNewSessionState(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
