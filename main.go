@@ -35,6 +35,9 @@ import (
 	"time"
 )
 
+// Unknown IP constant when discovery is unavailable or uncertain.
+const IPUnknown = "UNKNOWN"
+
 // Connection States
 const (
 	ConnDisconnected   = "DISCONNECTED"
@@ -94,6 +97,17 @@ func (r *RealCommandRunner) Run(ctx context.Context, name string, args ...string
 
 func (r *RealCommandRunner) IsMock() bool {
 	return false
+}
+
+// PublicIPFetcher retrieves candidate public IP strings from external discovery sources.
+type PublicIPFetcher func(ctx context.Context) ([]string, error)
+
+// RouteInfo holds the parsed result of `ip route get <DESTINATION>`.
+type RouteInfo struct {
+	Destination string `json:"destination"`
+	Gateway     string `json:"gateway,omitempty"`
+	Interface   string `json:"interface"`
+	SourceIP    string `json:"source_ip"`
 }
 
 // PacketListenerBinder abstracts UDP and Raw ICMP listener binding.
@@ -185,10 +199,32 @@ func (rs *ReceiverSession) markDone() {
 // PeerConfig holds authenticated peer details for persistent TLS connection monitoring.
 type PeerConfig struct {
 	Addr            string `json:"addr"`
+	ControlIP       string `json:"control_ip"`
 	ServerID        string `json:"server_id"`
 	PublicIP        string `json:"public_ip"`
+	LocalIP         string `json:"local_ip"`
 	CertFingerprint string `json:"cert_fingerprint"`
 	SharedSecret    string `json:"shared_secret"`
+}
+
+// EffectiveTargetIP returns the routable destination IP for sending test packets to this peer.
+func (p *PeerConfig) EffectiveTargetIP() string {
+	if p == nil {
+		return ""
+	}
+	if isPublicIPv4(p.PublicIP) {
+		return p.PublicIP
+	}
+	if isValidIPv4(p.ControlIP) {
+		return p.ControlIP
+	}
+	if host, _, err := net.SplitHostPort(p.Addr); err == nil && isValidIPv4(host) {
+		return host
+	}
+	if isValidIPv4(p.PublicIP) {
+		return p.PublicIP
+	}
+	return p.LocalIP
 }
 
 // PreparedSessionInfo holds Server A's record of a prepared receiver session on Server B.
@@ -205,16 +241,23 @@ type PreparedSessionInfo struct {
 type AppServer struct {
 	prepMu sync.Mutex
 
-	mu              sync.RWMutex
-	ServerID        string
-	ServerIP        string
-	Port            string
-	PairingSecret   string
-	AdminKey        string
-	CertFingerprint string
-	TLSCert         tls.Certificate
-	Runner          CommandRunner
-	Binder          PacketListenerBinder
+	mu               sync.RWMutex
+	ServerID         string
+	LocalIP          string // Outgoing interface IP determined via `ip route get`
+	LocalInterface   string // Outgoing interface name determined via `ip route get`
+	PublicIP         string // Public IPv4 ("UNKNOWN" unless manually set or verified via discovery)
+	ManualPublicIP   string // Operator-configured public IPv4 override
+	PublicIPSource   string // "MANUAL", "DISCOVERED", or "UNKNOWN"
+	ObservedPublicIP string // Public IP observed by remote peer during TLS pairing (if behind NAT)
+	ServerIP         string // Optional explicit bind/control IP override
+	Port             string
+	PairingSecret    string
+	AdminKey         string
+	CertFingerprint  string
+	TLSCert          tls.Certificate
+	Runner           CommandRunner
+	Binder           PacketListenerBinder
+	PublicFetcher    PublicIPFetcher
 
 	ConnState          string
 	LocalReceiverState string
@@ -244,20 +287,15 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 	srvID := randomHex(8)
 	pairSecret := randomHex(16)
 	adminKey := randomHex(12)
-	ip := getOutboundIP()
-
-	cert, fp, err := generateSelfSignedCert(ip)
-	if err != nil {
-		return nil, err
-	}
 
 	s := &AppServer{
 		ServerID:           srvID,
-		ServerIP:           ip,
+		LocalIP:            IPUnknown,
+		LocalInterface:     IPUnknown,
+		PublicIP:           IPUnknown,
+		PublicIPSource:     IPUnknown,
 		PairingSecret:      pairSecret,
 		AdminKey:           adminKey,
-		CertFingerprint:    fp,
-		TLSCert:            cert,
 		Runner:             runner,
 		Binder:             &RealListenerBinder{},
 		ConnState:          ConnDisconnected,
@@ -267,7 +305,224 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 		ActiveChains:       make(map[string][]string),
 		stopCh:             make(chan struct{}),
 	}
+
+	// Determine local outbound interface and local source IP via `ip route get`
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = s.RefreshLocalRouteInfo(ctx, "8.8.8.8")
+	cancel()
+
+	// Check environment variable for manually configured public IP
+	if envPub := strings.TrimSpace(os.Getenv("PUBLIC_IP")); envPub != "" {
+		_ = s.SetManualPublicIP(envPub)
+	}
+
+	cert, fp, err := generateSelfSignedCert(s.LocalIP, s.PublicIP)
+	if err != nil {
+		return nil, err
+	}
+	s.TLSCert = cert
+	s.CertFingerprint = fp
+
 	return s, nil
+}
+
+// RefreshLocalRouteInfo runs `ip route get <destIP>` to determine the local outgoing interface and source IP.
+// It NEVER sets PublicIP from the local route source IP.
+func (s *AppServer) RefreshLocalRouteInfo(ctx context.Context, destIP string) error {
+	if !isValidIPv4(destIP) {
+		destIP = "8.8.8.8"
+	}
+	rt, err := s.ResolveRoute(ctx, destIP)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil {
+		s.LocalIP = IPUnknown
+		s.LocalInterface = IPUnknown
+		return err
+	}
+	s.LocalIP = rt.SourceIP
+	s.LocalInterface = rt.Interface
+	return nil
+}
+
+// SetManualPublicIP sets or clears a manually configured public IPv4 address.
+func (s *AppServer) SetManualPublicIP(ipStr string) error {
+	ipStr = strings.TrimSpace(ipStr)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if ipStr == "" || strings.EqualFold(ipStr, IPUnknown) {
+		s.ManualPublicIP = ""
+		s.PublicIP = IPUnknown
+		s.PublicIPSource = IPUnknown
+		return nil
+	}
+	if !isPublicIPv4(ipStr) {
+		return fmt.Errorf("invalid public IPv4 address %q: must be a globally routable non-private IPv4 address", ipStr)
+	}
+	s.ManualPublicIP = ipStr
+	s.PublicIP = ipStr
+	s.PublicIPSource = "MANUAL"
+	return nil
+}
+
+// EffectivePublicIP returns the verified public IPv4 address, or "UNKNOWN" if unavailable/uncertain.
+// It never returns a private, loopback, or local interface address unless explicitly verified as public.
+func (s *AppServer) EffectivePublicIP() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if isPublicIPv4(s.ManualPublicIP) {
+		return s.ManualPublicIP
+	}
+	if isPublicIPv4(s.PublicIP) {
+		return s.PublicIP
+	}
+	if isPublicIPv4(s.ServerIP) {
+		return s.ServerIP
+	}
+	return IPUnknown
+}
+
+// EffectiveLocalIP returns the local outbound interface IP determined by `ip route get`.
+func (s *AppServer) EffectiveLocalIP() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if isValidIPv4(s.LocalIP) {
+		return s.LocalIP
+	}
+	if isValidIPv4(s.ServerIP) {
+		return s.ServerIP
+	}
+	return IPUnknown
+}
+
+// AdvertiseIP returns the best address to embed in the pairing token for peer reachability:
+// 1. Manually configured or discovered PublicIP (if valid public IPv4)
+// 2. Explicitly configured ServerIP override (used in local/loopback tests or custom bindings)
+// 3. LocalIP (for private LAN / VPN peering when PublicIP is UNKNOWN)
+func (s *AppServer) AdvertiseIP() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if isPublicIPv4(s.ManualPublicIP) {
+		return s.ManualPublicIP
+	}
+	if isPublicIPv4(s.PublicIP) {
+		return s.PublicIP
+	}
+	if isValidIPv4(s.ServerIP) {
+		return s.ServerIP
+	}
+	if isValidIPv4(s.LocalIP) {
+		return s.LocalIP
+	}
+	return IPUnknown
+}
+
+// DetectPublicIP discovers the server's public IPv4 address without ever guessing or falling back
+// to the local interface IP. If discovery fails, returns a private IP, or sources disagree, it sets
+// PublicIP to "UNKNOWN".
+func (s *AppServer) DetectPublicIP(ctx context.Context) string {
+	s.mu.RLock()
+	if isPublicIPv4(s.ManualPublicIP) {
+		pub := s.ManualPublicIP
+		s.mu.RUnlock()
+		return pub
+	}
+	fetcher := s.PublicFetcher
+	isMock := s.Runner != nil && s.Runner.IsMock()
+	s.mu.RUnlock()
+
+	if fetcher == nil {
+		if isMock {
+			s.mu.Lock()
+			s.PublicIP = IPUnknown
+			s.PublicIPSource = IPUnknown
+			s.mu.Unlock()
+			return IPUnknown
+		}
+		fetcher = defaultPublicIPFetcher
+	}
+
+	candidates, err := fetcher(ctx)
+	if err != nil {
+		s.mu.Lock()
+		if s.ManualPublicIP == "" {
+			s.PublicIP = IPUnknown
+			s.PublicIPSource = IPUnknown
+		}
+		s.mu.Unlock()
+		return IPUnknown
+	}
+
+	resolvedIP, source := EvaluateDiscoveredPublicIPs(candidates)
+	s.mu.Lock()
+	if s.ManualPublicIP == "" {
+		s.PublicIP = resolvedIP
+		s.PublicIPSource = source
+	} else {
+		resolvedIP = s.ManualPublicIP
+	}
+	s.mu.Unlock()
+	return resolvedIP
+}
+
+// EvaluateDiscoveredPublicIPs validates candidate public IP responses from external discovery services.
+// If any response is non-public/invalid or if multiple services disagree, it returns "UNKNOWN".
+func EvaluateDiscoveredPublicIPs(candidates []string) (string, string) {
+	var valid []string
+	for _, raw := range candidates {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		if !isPublicIPv4(trimmed) {
+			return IPUnknown, IPUnknown
+		}
+		valid = append(valid, trimmed)
+	}
+	if len(valid) == 0 {
+		return IPUnknown, IPUnknown
+	}
+	first := valid[0]
+	for _, v := range valid[1:] {
+		if v != first {
+			// Conflicting public IPs reported across discovery endpoints -> uncertain
+			return IPUnknown, IPUnknown
+		}
+	}
+	return first, "DISCOVERED"
+}
+
+func defaultPublicIPFetcher(ctx context.Context) ([]string, error) {
+	endpoints := []string{
+		"https://api.ipify.org",
+		"https://checkip.amazonaws.com",
+	}
+	client := &http.Client{Timeout: 2500 * time.Millisecond}
+	var results []string
+	for _, ep := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
+		if err != nil {
+			continue
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, rErr := io.ReadAll(io.LimitReader(resp.Body, 64))
+		_ = resp.Body.Close()
+		if rErr != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+		ipStr := strings.TrimSpace(string(body))
+		if ipStr != "" {
+			results = append(results, ipStr)
+		}
+	}
+	if len(results) == 0 {
+		return nil, errors.New("all public IP discovery endpoints failed")
+	}
+	return results, nil
 }
 
 func randomHex(nBytes int) string {
@@ -288,9 +543,10 @@ func (s *AppServer) AddLog(msg string) {
 }
 
 func (s *AppServer) PairingToken() string {
+	advIP := s.AdvertiseIP()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return fmt.Sprintf("%s:%s|%s|%s|%s", s.ServerIP, s.Port, s.ServerID, s.CertFingerprint, s.PairingSecret)
+	return fmt.Sprintf("%s:%s|%s|%s|%s", advIP, s.Port, s.ServerID, s.CertFingerprint, s.PairingSecret)
 }
 
 func ParsePairingToken(token string) (*PeerConfig, error) {
@@ -301,8 +557,14 @@ func ParsePairingToken(token string) (*PeerConfig, error) {
 	}
 	addr, srvID, fp, secret := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), strings.TrimSpace(parts[2]), strings.TrimSpace(parts[3])
 	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil || !isValidIPv4(host) {
+	if err != nil {
 		return nil, errors.New("آدرس IP یا پورت داخل توکن نامعتبر است")
+	}
+	if strings.EqualFold(host, IPUnknown) {
+		return nil, errors.New("آدرس سرور داخل توکن UNKNOWN است؛ لطفاً روی سرور مقابل آدرس IP را با -public-ip مشخص کنید")
+	}
+	if !isValidIPv4(host) {
+		return nil, errors.New("آدرس IP داخل توکن معتبر نیست")
 	}
 	p, err := strconv.Atoi(portStr)
 	if err != nil || p <= 0 || p > 65535 {
@@ -311,16 +573,83 @@ func ParsePairingToken(token string) (*PeerConfig, error) {
 	if len(srvID) < 8 || len(fp) != 64 || len(secret) < 16 {
 		return nil, errors.New("فیلدهای امنیتی توکن ناقص یا نامعتبر هستند")
 	}
+
+	pubIP := IPUnknown
+	localIP := IPUnknown
+	if isPublicIPv4(host) {
+		pubIP = host
+	} else {
+		localIP = host
+	}
+
 	return &PeerConfig{
 		Addr:            addr,
+		ControlIP:       host,
 		ServerID:        srvID,
-		PublicIP:        host,
+		PublicIP:        pubIP,
+		LocalIP:         localIP,
 		CertFingerprint: strings.ToLower(fp),
 		SharedSecret:    secret,
 	}, nil
 }
 
-func generateSelfSignedCert(ipStr string) (tls.Certificate, string, error) {
+// ResolvePeerConnectionAddresses determines the correct reverse-connection address,
+// public IP, and local IP for a peer during pairing without conflating private local IPs with public IPs.
+func ResolvePeerConnectionAddresses(req PeerPairRequest, observedRemoteHost string) (reverseAddr string, peerPublicIP string, peerLocalIP string, err error) {
+	listenPort := strings.TrimSpace(req.SenderListenPort)
+	senderHost := ""
+	if req.SenderAddr != "" {
+		if h, p, splitErr := net.SplitHostPort(strings.TrimSpace(req.SenderAddr)); splitErr == nil {
+			senderHost = h
+			if listenPort == "" {
+				listenPort = p
+			}
+		}
+	}
+	pNum, pErr := strconv.Atoi(listenPort)
+	if pErr != nil || pNum <= 0 || pNum > 65535 {
+		return "", IPUnknown, IPUnknown, errors.New("invalid sender listen port")
+	}
+
+	peerLocalIP = IPUnknown
+	if isValidIPv4(req.SenderLocalIP) {
+		peerLocalIP = strings.TrimSpace(req.SenderLocalIP)
+	} else if isValidIPv4(senderHost) && !isPublicIPv4(senderHost) {
+		peerLocalIP = senderHost
+	}
+
+	// Never assume a private or local IP is the public IP
+	peerPublicIP = IPUnknown
+	if isPublicIPv4(req.SenderPublicIP) {
+		peerPublicIP = strings.TrimSpace(req.SenderPublicIP)
+	}
+
+	// Select the correct address for reverse control connections (heartbeats/control):
+	// 1. If the peer has a verified public IP, use it.
+	// 2. Otherwise, if the TCP connection arrived from a public IP (e.g. peer is behind NAT with PublicIP=UNKNOWN),
+	//    use the observed remote public IP rather than the unreachable private LocalIP.
+	// 3. Otherwise (private LAN / VPN / loopback test), use the observed remote IP or reachable local IP.
+	var targetHost string
+	switch {
+	case isPublicIPv4(peerPublicIP):
+		targetHost = peerPublicIP
+	case isPublicIPv4(observedRemoteHost):
+		targetHost = strings.TrimSpace(observedRemoteHost)
+	case isValidIPv4(observedRemoteHost):
+		targetHost = strings.TrimSpace(observedRemoteHost)
+	case isValidIPv4(senderHost):
+		targetHost = senderHost
+	case isValidIPv4(peerLocalIP):
+		targetHost = peerLocalIP
+	default:
+		return "", IPUnknown, IPUnknown, errors.New("no valid reachable IPv4 address for peer")
+	}
+
+	reverseAddr = net.JoinHostPort(targetHost, strconv.Itoa(pNum))
+	return reverseAddr, peerPublicIP, peerLocalIP, nil
+}
+
+func generateSelfSignedCert(ips ...string) (tls.Certificate, string, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, "", err
@@ -330,21 +659,28 @@ func generateSelfSignedCert(ipStr string) (tls.Certificate, string, error) {
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}
+	cn := "checkspoof.local"
+	ipList := []net.IP{net.ParseIP("127.0.0.1")}
+	for _, ipStr := range ips {
+		if parsed := net.ParseIP(strings.TrimSpace(ipStr)); parsed != nil {
+			ipList = append(ipList, parsed)
+			if cn == "checkspoof.local" {
+				cn = ipStr
+			}
+		}
+	}
 	tmpl := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"CheckSpoof Diagnostic Node"},
-			CommonName:   ipStr,
+			CommonName:   cn,
 		},
 		NotBefore:             time.Now().Add(-1 * time.Hour),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-	}
-	if parsedIP := net.ParseIP(ipStr); parsedIP != nil {
-		tmpl.IPAddresses = append(tmpl.IPAddresses, parsedIP)
+		IPAddresses:           ipList,
 	}
 	derBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {
@@ -730,23 +1066,75 @@ func (s *AppServer) CleanupAllChains() {
 	}
 }
 
-// Routing & Interface Discovery
+// Routing & Interface Discovery via `ip route get`
 
-func (s *AppServer) ResolveOutgoingInterface(ctx context.Context, targetIP string) (string, error) {
+// ParseIPRouteGetOutput parses the output of `ip route get <DEST>` to extract
+// the actual outgoing interface (`dev`), local source IP (`src`), and gateway (`via`).
+func ParseIPRouteGetOutput(output string) (RouteInfo, error) {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return RouteInfo{}, errors.New("empty ip route get output")
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "unreachable") || strings.Contains(lower, "prohibit") || strings.Contains(lower, "blackhole") {
+		return RouteInfo{}, fmt.Errorf("route is unreachable: %s", trimmed)
+	}
+
+	fields := strings.Fields(trimmed)
+	var info RouteInfo
+	for i, w := range fields {
+		if i == 0 && isValidIPv4(w) {
+			info.Destination = w
+		} else if i == 1 && fields[0] == "local" && isValidIPv4(w) {
+			info.Destination = w
+		}
+		if w == "dev" && i+1 < len(fields) && info.Interface == "" {
+			info.Interface = fields[i+1]
+		}
+		if w == "src" && i+1 < len(fields) && info.SourceIP == "" {
+			info.SourceIP = fields[i+1]
+		}
+		if w == "via" && i+1 < len(fields) && info.Gateway == "" {
+			info.Gateway = fields[i+1]
+		}
+	}
+
+	if info.Interface == "" {
+		return RouteInfo{}, fmt.Errorf("no outgoing interface (dev) found in route output: %s", trimmed)
+	}
+	if !isValidIPv4(info.SourceIP) {
+		return RouteInfo{}, fmt.Errorf("no valid local source IP (src) found in route output: %s", trimmed)
+	}
+	return info, nil
+}
+
+// ResolveRoute runs `ip route get <targetIP>` and returns the parsed RouteInfo
+// containing both the outgoing interface and the local source IP for that destination.
+func (s *AppServer) ResolveRoute(ctx context.Context, targetIP string) (RouteInfo, error) {
 	if !isValidIPv4(targetIP) {
-		return "", errors.New("invalid target IPv4 address")
+		return RouteInfo{}, errors.New("invalid target IPv4 address")
 	}
 	out, exitCode, err := s.Runner.Run(ctx, "ip", "route", "get", targetIP)
 	if err != nil || exitCode != 0 {
-		return "", fmt.Errorf("route lookup failed for %s: %v (%s)", targetIP, err, strings.TrimSpace(string(out)))
+		return RouteInfo{}, fmt.Errorf("route lookup failed for %s: %v (%s)", targetIP, err, strings.TrimSpace(string(out)))
 	}
-	fields := strings.Fields(string(out))
-	for i, w := range fields {
-		if w == "dev" && i+1 < len(fields) {
-			return fields[i+1], nil
-		}
+	info, parseErr := ParseIPRouteGetOutput(string(out))
+	if parseErr != nil {
+		return RouteInfo{}, parseErr
 	}
-	return "", fmt.Errorf("no outgoing interface found in route output: %s", strings.TrimSpace(string(out)))
+	if info.Destination == "" {
+		info.Destination = targetIP
+	}
+	return info, nil
+}
+
+// ResolveOutgoingInterface uses `ResolveRoute` to return the outgoing interface for targetIP.
+func (s *AppServer) ResolveOutgoingInterface(ctx context.Context, targetIP string) (string, error) {
+	info, err := s.ResolveRoute(ctx, targetIP)
+	if err != nil {
+		return "", err
+	}
+	return info.Interface, nil
 }
 
 // Receiver Readiness & Deadlock-Free Background Packet Listener Lifecycle
@@ -1185,6 +1573,7 @@ func extractIPString(addr net.Addr) string {
 type HeartbeatPayload struct {
 	ServerID        string `json:"server_id"`
 	PublicIP        string `json:"public_ip"`
+	LocalIP         string `json:"local_ip"`
 	ListenPort      string `json:"listen_port"`
 	ReceiverState   string `json:"receiver_state"`
 	ActiveSessionID string `json:"active_session_id"`
@@ -1206,6 +1595,9 @@ func (s *AppServer) StartHeartbeatLoop() {
 }
 
 func (s *AppServer) performHeartbeatTick() {
+	pubIP := s.EffectivePublicIP()
+	locIP := s.EffectiveLocalIP()
+
 	s.mu.RLock()
 	peer := s.Peer
 	localRecv := s.LocalReceiverState
@@ -1221,7 +1613,8 @@ func (s *AppServer) performHeartbeatTick() {
 
 	reqPayload := HeartbeatPayload{
 		ServerID:        s.ServerID,
-		PublicIP:        s.ServerIP,
+		PublicIP:        pubIP,
+		LocalIP:         locIP,
 		ListenPort:      s.Port,
 		ReceiverState:   localRecv,
 		ActiveSessionID: activeSessID,
@@ -1252,6 +1645,9 @@ func (s *AppServer) performHeartbeatTick() {
 	s.ConnState = ConnConnected
 	s.LastHeartbeat = time.Now()
 	s.PeerReceiverState = respPayload.ReceiverState
+	if s.Peer != nil && isPublicIPv4(respPayload.PublicIP) {
+		s.Peer.PublicIP = respPayload.PublicIP
+	}
 
 	if s.PreparedSession != nil {
 		if respPayload.ActiveSessionID != s.PreparedSession.SessionID ||
@@ -1342,6 +1738,8 @@ type PeerPairRequest struct {
 	SenderServerID        string `json:"sender_server_id"`
 	SenderAddr            string `json:"sender_addr"`
 	SenderPublicIP        string `json:"sender_public_ip"`
+	SenderLocalIP         string `json:"sender_local_ip"`
+	SenderListenPort      string `json:"sender_listen_port"`
 	SenderCertFingerprint string `json:"sender_cert_fingerprint"`
 	SenderSecret          string `json:"sender_secret"`
 }
@@ -1349,6 +1747,8 @@ type PeerPairRequest struct {
 type PeerPairResponse struct {
 	ReceiverServerID        string `json:"receiver_server_id"`
 	ReceiverPublicIP        string `json:"receiver_public_ip"`
+	ReceiverLocalIP         string `json:"receiver_local_ip"`
+	ObservedSenderPublicIP  string `json:"observed_sender_public_ip"`
 	ReceiverCertFingerprint string `json:"receiver_cert_fingerprint"`
 	ReceiverState           string `json:"receiver_state"`
 }
@@ -1361,16 +1761,34 @@ func (s *AppServer) handlePeerPair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
 		return
 	}
-	if !isValidIPv4(req.SenderPublicIP) || len(req.SenderCertFingerprint) != 64 {
+	if len(req.SenderCertFingerprint) != 64 || len(req.SenderServerID) < 8 {
 		http.Error(w, "Invalid peer identity parameters", http.StatusBadRequest)
 		return
 	}
 
+	observedHost, _, _ := net.SplitHostPort(r.RemoteAddr)
+	reverseAddr, peerPubIP, peerLocIP, addrErr := ResolvePeerConnectionAddresses(req, observedHost)
+	if addrErr != nil {
+		http.Error(w, addrErr.Error(), http.StatusBadRequest)
+		return
+	}
+	revHost, _, _ := net.SplitHostPort(reverseAddr)
+
+	observedPub := IPUnknown
+	if isPublicIPv4(observedHost) {
+		observedPub = observedHost
+	}
+
+	myPubIP := s.EffectivePublicIP()
+	myLocIP := s.EffectiveLocalIP()
+
 	s.mu.Lock()
 	s.Peer = &PeerConfig{
-		Addr:            req.SenderAddr,
+		Addr:            reverseAddr,
+		ControlIP:       revHost,
 		ServerID:        req.SenderServerID,
-		PublicIP:        req.SenderPublicIP,
+		PublicIP:        peerPubIP,
+		LocalIP:         peerLocIP,
 		CertFingerprint: strings.ToLower(req.SenderCertFingerprint),
 		SharedSecret:    s.PairingSecret,
 	}
@@ -1380,12 +1798,15 @@ func (s *AppServer) handlePeerPair(w http.ResponseWriter, r *http.Request) {
 	localRecv := s.LocalReceiverState
 	s.mu.Unlock()
 
-	s.AddLog(fmt.Sprintf("🔐 [Pairing] Authenticated mutual TLS pairing with peer %s (ID=%s)", req.SenderAddr, req.SenderServerID))
+	s.AddLog(fmt.Sprintf("🔐 [Pairing] Paired with peer ID=%s (ReverseAddr=%s, PeerPublicIP=%s, PeerLocalIP=%s)",
+		req.SenderServerID, reverseAddr, peerPubIP, peerLocIP))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(PeerPairResponse{
 		ReceiverServerID:        s.ServerID,
-		ReceiverPublicIP:        s.ServerIP,
+		ReceiverPublicIP:        myPubIP,
+		ReceiverLocalIP:         myLocIP,
+		ObservedSenderPublicIP:  observedPub,
 		ReceiverCertFingerprint: s.CertFingerprint,
 		ReceiverState:           localRecv,
 	})
@@ -1398,12 +1819,21 @@ func (s *AppServer) handlePeerHeartbeat(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	myPubIP := s.EffectivePublicIP()
+	myLocIP := s.EffectiveLocalIP()
+
 	s.mu.Lock()
 	if s.Peer != nil && s.Peer.ServerID == req.ServerID {
 		s.ConnState = ConnConnected
 		s.LastHeartbeat = time.Now()
 		s.MissedHeartbeats = 0
 		s.PeerReceiverState = req.ReceiverState
+		if isPublicIPv4(req.PublicIP) {
+			s.Peer.PublicIP = req.PublicIP
+		}
+		if isValidIPv4(req.LocalIP) {
+			s.Peer.LocalIP = req.LocalIP
+		}
 	}
 	localRecv := s.LocalReceiverState
 	var activeSessID string
@@ -1415,7 +1845,8 @@ func (s *AppServer) handlePeerHeartbeat(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(HeartbeatPayload{
 		ServerID:        s.ServerID,
-		PublicIP:        s.ServerIP,
+		PublicIP:        myPubIP,
+		LocalIP:         myLocIP,
 		ListenPort:      s.Port,
 		ReceiverState:   localRecv,
 		ActiveSessionID: activeSessID,
@@ -1523,15 +1954,34 @@ func (s *AppServer) handleAdminPair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Determine the local source IP and interface specifically for reaching peerCfg.ControlIP via `ip route get`
+	routeCtx, routeCancel := context.WithTimeout(r.Context(), 2*time.Second)
+	rtInfo, rtErr := s.ResolveRoute(routeCtx, peerCfg.ControlIP)
+	routeCancel()
+
+	senderLocalIP := s.EffectiveLocalIP()
+	if rtErr == nil && isValidIPv4(rtInfo.SourceIP) {
+		senderLocalIP = rtInfo.SourceIP
+		s.mu.Lock()
+		s.LocalIP = rtInfo.SourceIP
+		s.LocalInterface = rtInfo.Interface
+		s.mu.Unlock()
+	}
+
 	s.mu.Lock()
 	s.ConnState = ConnAuthenticating
 	s.PreparedSession = nil
 	s.mu.Unlock()
 
+	senderPubIP := s.EffectivePublicIP()
+	advHost := s.AdvertiseIP()
+
 	pairReq := PeerPairRequest{
 		SenderServerID:        s.ServerID,
-		SenderAddr:            fmt.Sprintf("%s:%s", s.ServerIP, s.Port),
-		SenderPublicIP:        s.ServerIP,
+		SenderAddr:            fmt.Sprintf("%s:%s", advHost, s.Port),
+		SenderPublicIP:        senderPubIP,
+		SenderLocalIP:         senderLocalIP,
+		SenderListenPort:      s.Port,
 		SenderCertFingerprint: s.CertFingerprint,
 		SenderSecret:          peerCfg.SharedSecret,
 	}
@@ -1548,7 +1998,17 @@ func (s *AppServer) handleAdminPair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isPublicIPv4(pairResp.ReceiverPublicIP) {
+		peerCfg.PublicIP = pairResp.ReceiverPublicIP
+	}
+	if isValidIPv4(pairResp.ReceiverLocalIP) {
+		peerCfg.LocalIP = pairResp.ReceiverLocalIP
+	}
+
 	s.mu.Lock()
+	if isPublicIPv4(pairResp.ObservedSenderPublicIP) {
+		s.ObservedPublicIP = pairResp.ObservedSenderPublicIP
+	}
 	s.Peer = peerCfg
 	s.ConnState = ConnConnected
 	s.PeerReceiverState = pairResp.ReceiverState
@@ -1556,14 +2016,46 @@ func (s *AppServer) handleAdminPair(w http.ResponseWriter, r *http.Request) {
 	s.MissedHeartbeats = 0
 	s.mu.Unlock()
 
-	s.AddLog(fmt.Sprintf("✅ [Pairing] Connected over TLS 1.3 to Peer ID=%s (%s)", pairResp.ReceiverServerID, peerCfg.Addr))
+	s.AddLog(fmt.Sprintf("✅ [Pairing] Connected over TLS 1.3 to Peer ID=%s (ControlAddr=%s, PeerPublicIP=%s)",
+		pairResp.ReceiverServerID, peerCfg.Addr, peerCfg.PublicIP))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":         "CONNECTED",
-		"peer_server_id": pairResp.ReceiverServerID,
-		"peer_ip":        peerCfg.PublicIP,
-		"receiver_state": pairResp.ReceiverState,
+		"status":          "CONNECTED",
+		"peer_server_id":  pairResp.ReceiverServerID,
+		"peer_ip":         peerCfg.EffectiveTargetIP(),
+		"peer_public_ip":  peerCfg.PublicIP,
+		"peer_local_ip":   peerCfg.LocalIP,
+		"receiver_state":  pairResp.ReceiverState,
+		"local_source_ip": senderLocalIP,
+	})
+}
+
+func (s *AppServer) handleAdminPublicIP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		PublicIP string `json:"public_ip"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := s.SetManualPublicIP(req.PublicIP); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	pub := s.EffectivePublicIP()
+	s.AddLog(fmt.Sprintf("🌐 [Config] Public IP updated to %s (Source=%s)", pub, s.PublicIPSource))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"public_ip":        pub,
+		"public_ip_source": s.PublicIPSource,
+		"pairing_token":    s.PairingToken(),
 	})
 }
 
@@ -1660,8 +2152,6 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// AdminTestResult explicitly separates receiver readiness, SNAT rule installation,
-// local packet generation, local rule counter matching, and genuine remote spoof reception.
 type AdminTestResult struct {
 	SessionID             string                 `json:"session_id"`
 	PrimaryClassification string                 `json:"primary_classification"`
@@ -1680,6 +2170,7 @@ type AdminTestResult struct {
 	RemoteDuplicateCount  int                    `json:"remote_duplicate_count"`
 	VerifiedPackets       []VerifiedPacketRecord `json:"verified_packets"`
 	OutgoingInterface     string                 `json:"outgoing_interface"`
+	OutgoingSourceIP      string                 `json:"outgoing_source_ip"`
 	IsolatedChainName     string                 `json:"isolated_chain_name"`
 	StatusClass           string                 `json:"status_class"`
 	ResultTitle           string                 `json:"result_title"`
@@ -1726,32 +2217,67 @@ func (s *AppServer) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(result)
 }
 
-// isGenuineNetworkSpoofSetup returns true only if:
-// 1. The command runner is executing real OS commands (not a mock runner).
-// 2. TargetIP, SenderIP, and SpoofIP are non-loopback, routable IPv4 addresses.
-// 3. SpoofIP is distinct from the sender's own IP and target's IP.
+// isGenuineNetworkSpoofSetup checks whether the current test environment represents a genuine
+// non-loopback, non-mocked spoofing test where SpoofIP differs from both the sender's local
+// outbound source IP and the sender's public/NAT IP.
 func (s *AppServer) isGenuineNetworkSpoofSetup(targetIP, spoofIP string) (bool, string) {
+	return s.isGenuineNetworkSpoofSetupWithRoute(targetIP, spoofIP, "")
+}
+
+func (s *AppServer) isGenuineNetworkSpoofSetupWithRoute(targetIP, spoofIP, routeSourceIP string) (bool, string) {
 	if s.Runner == nil || s.Runner.IsMock() {
 		return false, "mocked CommandRunner is in use (iptables SNAT not applied to real kernel netfilter)"
 	}
 	tIP := net.ParseIP(strings.TrimSpace(targetIP))
 	spIP := net.ParseIP(strings.TrimSpace(spoofIP))
-	srvIP := net.ParseIP(strings.TrimSpace(s.ServerIP))
-
 	if tIP == nil || spIP == nil {
 		return false, "invalid target or spoof IPv4 address"
 	}
-	if tIP.IsLoopback() || spIP.IsLoopback() || (srvIP != nil && srvIP.IsLoopback()) {
-		return false, fmt.Sprintf("loopback address detected (sender=%s, target=%s, spoof=%s); loopback traffic bypasses physical NICs and upstream routers", s.ServerIP, targetIP, spoofIP)
+
+	s.mu.RLock()
+	locIPStr := s.LocalIP
+	pubIPStr := s.PublicIP
+	manPubStr := s.ManualPublicIP
+	obsPubStr := s.ObservedPublicIP
+	srvIPStr := s.ServerIP
+	s.mu.RUnlock()
+
+	if routeSourceIP != "" {
+		locIPStr = routeSourceIP
 	}
-	if srvIP != nil && spIP.Equal(srvIP) {
-		return false, fmt.Sprintf("spoof_ip (%s) is identical to sender's own IP (%s); no source IP spoofing occurred", spoofIP, s.ServerIP)
+
+	locIP := net.ParseIP(strings.TrimSpace(locIPStr))
+	srvIP := net.ParseIP(strings.TrimSpace(srvIPStr))
+
+	if tIP.IsLoopback() || spIP.IsLoopback() || (locIP != nil && locIP.IsLoopback()) || (srvIP != nil && srvIP.IsLoopback()) {
+		return false, fmt.Sprintf("loopback address detected (local=%s, target=%s, spoof=%s); loopback traffic bypasses physical NICs and upstream routers", locIPStr, targetIP, spoofIP)
 	}
+	if spIP.Equal(tIP) {
+		return false, fmt.Sprintf("spoof_ip (%s) is identical to target_ip (%s)", spoofIP, targetIP)
+	}
+
+	// Ensure spoofIP does not match any of the sender's own local or public/NAT addresses
+	ownCandidates := []struct {
+		label string
+		val   string
+	}{
+		{"sender local route source IP", locIPStr},
+		{"sender public IP", pubIPStr},
+		{"sender manual public IP", manPubStr},
+		{"sender observed NAT public IP", obsPubStr},
+		{"sender configured IP", srvIPStr},
+	}
+	for _, c := range ownCandidates {
+		if parsed := net.ParseIP(strings.TrimSpace(c.val)); parsed != nil && spIP.Equal(parsed) {
+			return false, fmt.Sprintf("spoof_ip (%s) is identical to %s (%s); no source IP spoofing occurred", spoofIP, c.label, c.val)
+		}
+	}
+
 	return true, ""
 }
 
 func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig, prep *PreparedSessionInfo) AdminTestResult {
-	targetIP := peer.PublicIP
+	targetIP := peer.EffectiveTargetIP()
 	res := AdminTestResult{
 		SessionID:             prep.SessionID,
 		PacketsAttempted:      prep.PacketCount,
@@ -1769,8 +2295,8 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		}, &dummy, 3*time.Second)
 	}()
 
-	// Stage 1: Route & Interface Resolution
-	iface, err := s.ResolveOutgoingInterface(ctx, targetIP)
+	// Stage 1: Route, Outgoing Interface & Local Source IP Resolution via `ip route get TARGET_IP`
+	routeInfo, err := s.ResolveRoute(ctx, targetIP)
 	if err != nil {
 		s.AddLog(fmt.Sprintf("[-] [Routing] %v", err))
 		res.PrimaryClassification = ClassRoutingError
@@ -1778,10 +2304,17 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		res.StatusClass = "failure"
 		res.ResultTitle = "❌ خطای مسیریابی (ROUTING_ERROR)"
 		res.ConfirmedEvidence = fmt.Sprintf("مسیریابی کرنل برای مقصد %s شکست خورد: %v", targetIP, err)
-		res.PossibleExplanations = "جدول مسیریابی سرور (ip route) مسیر معتبری به سمت سرور دوم ندارد."
+		res.PossibleExplanations = "جدول مسیریابی سرور (ip route get) مسیر معتبری به سمت سرور دوم ندارد."
 		return res
 	}
+	iface := routeInfo.Interface
 	res.OutgoingInterface = iface
+	res.OutgoingSourceIP = routeInfo.SourceIP
+
+	s.mu.Lock()
+	s.LocalIP = routeInfo.SourceIP
+	s.LocalInterface = routeInfo.Interface
+	s.mu.Unlock()
 
 	// Stage 2: Isolated iptables SNAT Chain Installation
 	shortID := prep.SessionID[:8]
@@ -1800,7 +2333,8 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	res.SNATRuleInstalled = true
 	res.IsolatedChainName = chainIso.ChainName
 	res.Classifications = append(res.Classifications, ClassSNATRuleInstalled)
-	s.AddLog(fmt.Sprintf("[Sender] Installed isolated SNAT chain %s on interface %s -> to:%s", chainIso.ChainName, iface, prep.ExpectedSourceIP))
+	s.AddLog(fmt.Sprintf("[Sender] Installed isolated SNAT chain %s on dev %s (local src %s -> spoof to:%s)",
+		chainIso.ChainName, iface, routeInfo.SourceIP, prep.ExpectedSourceIP))
 
 	// Stage 3: Local Packet Generation
 	packetsSent := 0
@@ -1901,7 +2435,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		return res
 	}
 
-	// Count only packets whose observed remote SourceIP strictly matches prep.ExpectedSourceIP
 	matchingSpoofSourceCount := 0
 	for _, vp := range remoteReport.VerifiedPackets {
 		if vp.SourceIP == prep.ExpectedSourceIP {
@@ -1925,9 +2458,8 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	}
 
 	if matchingSpoofSourceCount > 0 {
-		genuineNet, simReason := s.isGenuineNetworkSpoofSetup(targetIP, prep.ExpectedSourceIP)
+		genuineNet, simReason := s.isGenuineNetworkSpoofSetupWithRoute(targetIP, prep.ExpectedSourceIP, routeInfo.SourceIP)
 		if !genuineNet {
-			// NEVER report SPOOF_SUCCESS on loopback, mocked iptables, or unspoofed source IPs
 			res.IsLoopbackOrSimulated = true
 			res.RemoteSpoofVerified = false
 			res.PrimaryClassification = ClassSimulatedControlVerified
@@ -1944,7 +2476,7 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		res.Classifications = append(res.Classifications, ClassSpoofSuccess)
 		res.StatusClass = "success"
 		res.ResultTitle = "✅ تایید قطعی IP Spoofing در سرور دوم (SPOOF_SUCCESS)"
-		res.ConfirmedEvidence = fmt.Sprintf("شواهد تفکیک‌شده: ۱) شنونده مقصد آماده بود، ۲) زنجیره SNAT (%s) نصب شد، ۳) %d پکت در مبدا تولید شد، ۴) %d پکت در کرنل تغییر مبدا یافت و ۵) سرور دوم (%s) دقیقاً %d پکت رمزنگاری‌شده با آدرس مبدا اسپوف‌شده (%s) دریافت و تایید کرد.", chainIso.ChainName, packetsSent, snatPkts, targetIP, matchingSpoofSourceCount, prep.ExpectedSourceIP)
+		res.ConfirmedEvidence = fmt.Sprintf("شواهد تفکیک‌شده: ۱) شنونده مقصد آماده بود، ۲) زنجیره SNAT (%s) روی اینترفیس %s (با IP محلی %s) نصب شد، ۳) %d پکت در مبدا تولید شد، ۴) %d پکت در کرنل تغییر مبدا یافت و ۵) سرور دوم (%s) دقیقاً %d پکت رمزنگاری‌شده با آدرس مبدا اسپوف‌شده (%s) دریافت و تایید کرد.", chainIso.ChainName, iface, routeInfo.SourceIP, packetsSent, snatPkts, targetIP, matchingSpoofSourceCount, prep.ExpectedSourceIP)
 		res.PossibleExplanations = "شبکه مبدا و مسیر بین دو سرور، پکت‌های دارای آدرس مبدا جعلی (Spoofed Source IP) را مسدود نکرده‌اند."
 		return res
 	}
@@ -1954,8 +2486,8 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	res.Classifications = append(res.Classifications, ClassRemoteNotReceived)
 	res.StatusClass = "failure"
 	res.ResultTitle = "❌ عدم دریافت پکت اسپوف‌شده در سرور دوم (REMOTE_PACKET_NOT_RECEIVED)"
-	res.ConfirmedEvidence = fmt.Sprintf("شواهد تفکیک‌شده: ۱) شنونده مقصد آماده بود، ۲) زنجیره SNAT (%s) نصب شد، ۳) %d پکت در مبدا تولید شد و ۴) %d پکت (%d بایت) با قانون SNAT محلی تطابق یافت؛ اما ۵) سرور دوم ۰ پکت با آدرس اسپوف‌شده (%s) دریافت کرد. (نصب قانون یا افزایش شمارنده SNAT به تنهایی دلیل موفقیت اسپوفینگ نیست.)", chainIso.ChainName, packetsSent, snatPkts, snatBytes, prep.ExpectedSourceIP)
-	res.PossibleExplanations = "دلایل محتمل: ۱) فیلترینگ مبدا در روتر بالادست یا دیتاسنتر فرستنده (BCP 38 / uRPF)، ۲) مسدود شدن در فایروال مسیر یا سرور مقصد، ۳) عدم تطابق مسیر خروجی یا از دست رفتن پکت در شبکه."
+	res.ConfirmedEvidence = fmt.Sprintf("شواهد تفکیک‌شده: ۱) شنونده مقصد آماده بود، ۲) زنجیره SNAT (%s) روی اینترفیس %s (IP محلی %s) نصب شد، ۳) %d پکت در مبدا تولید شد و ۴) %d پکت (%d بایت) با قانون SNAT محلی تطابق یافت؛ اما ۵) سرور دوم ۰ پکت با آدرس اسپوف‌شده (%s) دریافت کرد. (نصب قانون یا افزایش شمارنده SNAT به تنهایی دلیل موفقیت اسپوفینگ نیست.)", chainIso.ChainName, iface, routeInfo.SourceIP, packetsSent, snatPkts, snatBytes, prep.ExpectedSourceIP)
+	res.PossibleExplanations = "دلایل محتمل: ۱) فیلترینگ مبدا در روتر بالادست یا دیتاسنتر فرستنده (BCP 38 / uRPF) یا بازنویسی مجدد توسط NAT بالادست، ۲) مسدود شدن در فایروال مسیر یا سرور مقصد، ۳) عدم تطابق مسیر خروجی یا از دست رفتن پکت در شبکه."
 	return res
 }
 
@@ -1976,11 +2508,20 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 		packetCount = 3
 	}
 
-	// Phase 1: Mutual TLS Pairing
+	// Resolve route to peer to identify actual outgoing interface and local source IP
+	if rt, rtErr := s.ResolveRoute(ctx, peerCfg.ControlIP); rtErr == nil {
+		s.mu.Lock()
+		s.LocalIP = rt.SourceIP
+		s.LocalInterface = rt.Interface
+		s.mu.Unlock()
+	}
+
 	pairReq := PeerPairRequest{
 		SenderServerID:        s.ServerID,
-		SenderAddr:            fmt.Sprintf("%s:%s", s.ServerIP, s.Port),
-		SenderPublicIP:        s.ServerIP,
+		SenderAddr:            fmt.Sprintf("%s:%s", s.AdvertiseIP(), s.Port),
+		SenderPublicIP:        s.EffectivePublicIP(),
+		SenderLocalIP:         s.EffectiveLocalIP(),
+		SenderListenPort:      s.Port,
 		SenderCertFingerprint: s.CertFingerprint,
 		SenderSecret:          peerCfg.SharedSecret,
 	}
@@ -1989,14 +2530,23 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 		return AdminTestResult{}, fmt.Errorf("phase 1 TLS pairing failed: %w", err)
 	}
 
+	if isPublicIPv4(pairResp.ReceiverPublicIP) {
+		peerCfg.PublicIP = pairResp.ReceiverPublicIP
+	}
+	if isValidIPv4(pairResp.ReceiverLocalIP) {
+		peerCfg.LocalIP = pairResp.ReceiverLocalIP
+	}
+
 	s.mu.Lock()
+	if isPublicIPv4(pairResp.ObservedSenderPublicIP) {
+		s.ObservedPublicIP = pairResp.ObservedSenderPublicIP
+	}
 	s.Peer = peerCfg
 	s.ConnState = ConnConnected
 	s.PeerReceiverState = pairResp.ReceiverState
 	s.LastHeartbeat = time.Now()
 	s.mu.Unlock()
 
-	// Phase 2: Explicit Receiver Listener Preparation
 	sessionID := randomHex(16)
 	nonce := randomHex(16)
 	prepReq := PeerPrepareRequest{
@@ -2025,20 +2575,37 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 		PacketCount:      packetCount,
 	}
 
-	// Phase 3: Execute Coordinated Spoof Test & Verify Remote Reception
 	result := s.executeCoordinatedTest(ctx, peerCfg, prepInfo)
 	return result, nil
 }
 
 func (s *AppServer) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	pubIP := s.EffectivePublicIP()
+	locIP := s.EffectiveLocalIP()
+	advIP := s.AdvertiseIP()
+	token := s.PairingToken()
+
 	s.mu.RLock()
+	iface := s.LocalInterface
+	if iface == "" {
+		iface = IPUnknown
+	}
+	pubSource := s.PublicIPSource
 	peerAddr := "—"
 	peerID := "—"
 	peerIP := "—"
+	peerPubIP := IPUnknown
+	peerLocIP := IPUnknown
 	if s.Peer != nil {
 		peerAddr = s.Peer.Addr
 		peerID = s.Peer.ServerID
-		peerIP = s.Peer.PublicIP
+		peerIP = s.Peer.EffectiveTargetIP()
+		if s.Peer.PublicIP != "" {
+			peerPubIP = s.Peer.PublicIP
+		}
+		if s.Peer.LocalIP != "" {
+			peerLocIP = s.Peer.LocalIP
+		}
 	}
 	lastHB := "—"
 	if !s.LastHeartbeat.IsZero() {
@@ -2050,14 +2617,21 @@ func (s *AppServer) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]interface{}{
 		"server_id":            s.ServerID,
-		"server_ip":            s.ServerIP,
+		"server_ip":            advIP,
+		"local_ip":             locIP,
+		"local_interface":      iface,
+		"public_ip":            pubIP,
+		"public_ip_source":     pubSource,
 		"port":                 s.Port,
+		"pairing_token":        token,
 		"conn_state":           s.ConnState,
 		"local_receiver_state": s.LocalReceiverState,
 		"peer_receiver_state":  s.PeerReceiverState,
 		"peer_addr":            peerAddr,
 		"peer_id":              peerID,
 		"peer_ip":              peerIP,
+		"peer_public_ip":       peerPubIP,
+		"peer_local_ip":        peerLocIP,
 		"last_heartbeat":       lastHB,
 		"prepared_session_id":  prepSessID,
 	}
@@ -2089,7 +2663,9 @@ func (s *AppServer) handleAdminClearLogs(w http.ResponseWriter, r *http.Request)
 
 type DashboardData struct {
 	ServerID        string
-	ServerIP        string
+	LocalIP         string
+	PublicIP        string
+	PublicIPSource  string
 	Port            string
 	Iface           string
 	CertFingerprint string
@@ -2235,13 +2811,13 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="brand-icon">🛡️</div>
                 <div class="brand-text">
                     <h1>CheckSpoof Enterprise v2</h1>
-                    <p>سامانه مهندسی تشخیص IP Spoofing با تفکیک مراحل محلی و تایید واقعی در سرور دوم</p>
+                    <p>سامانه مهندسی تشخیص IP Spoofing با تفکیک IP اینترفیس محلی از IP عمومی (Public IP)</p>
                 </div>
             </div>
             <div class="nav-pills">
-                <div class="pill"><span>شناسه سرور:</span><strong>{{.ServerID}}</strong></div>
-                <div class="pill"><span>آدرس:</span><strong>{{.ServerIP}}:{{.Port}}</strong></div>
-                <div class="pill"><span>اینترفیس:</span><strong>{{.Iface}}</strong></div>
+                <div class="pill"><span>شناسه:</span><strong>{{.ServerID}}</strong></div>
+                <div class="pill"><span>IP محلی ({{.Iface}}):</span><strong id="local_ip_badge">{{.LocalIP}}:{{.Port}}</strong></div>
+                <div class="pill"><span>IP عمومی (Public):</span><strong id="public_ip_badge">{{.PublicIP}}</strong></div>
                 <div class="pill"><span>وضعیت اتصال:</span><strong id="conn_state_badge">DISCONNECTED</strong></div>
                 <div class="pill"><span>آمادگی گیرنده:</span><strong id="recv_state_badge">IDLE</strong></div>
                 <div class="pill"><span>آخرین ضربان:</span><strong id="hb_badge">—</strong></div>
@@ -2264,7 +2840,15 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="dashboard-grid">
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">⚙️ ۱. جفت‌سازی دوطرفه (TLS 1.3) و آماده‌سازی گیرنده</h2>
+                    <h2 class="card-title">⚙️ ۱. تنظیمات آدرس عمومی، جفت‌سازی TLS و آماده‌سازی گیرنده</h2>
+                </div>
+
+                <div class="form-group">
+                    <label>🌐 تنظیم دستی IP عمومی این سرور (اختیاری — در صورت قرارگیری پشت NAT یا UNKNOWN بودن):</label>
+                    <div class="connect-group">
+                        <input type="text" id="manual_public_ip" class="ltr-input" placeholder="مثال: 203.0.113.50 (خالی = تشخیص خودکار / UNKNOWN)">
+                        <button class="btn-sm" onclick="savePublicIP()">ثبت IP عمومی</button>
+                    </div>
                 </div>
 
                 <div class="form-group">
@@ -2383,6 +2967,26 @@ const dashboardHTML = `<!DOCTYPE html>
             setTimeout(() => { btn.innerText = 'کپی توکن'; }, 2000);
         }
 
+        function savePublicIP() {
+            const val = document.getElementById('manual_public_ip').value.trim();
+            fetch('/api/admin/public-ip', {
+                method: 'POST',
+                headers: apiHeaders(),
+                body: JSON.stringify({ public_ip: val })
+            })
+            .then(async r => {
+                if (!r.ok) throw new Error(await r.text());
+                return r.json();
+            })
+            .then(d => {
+                document.getElementById('public_ip_badge').innerText = d.public_ip;
+                const el = document.getElementById('my_token');
+                el.setAttribute('data-token', d.pairing_token);
+                if (tokenVisible) el.innerText = d.pairing_token;
+            })
+            .catch(err => alert('خطا: ' + err.message));
+        }
+
         function setSpoof(ip) {
             document.getElementById('spoof_ip').value = ip;
             invalidatePrepare();
@@ -2403,7 +3007,15 @@ const dashboardHTML = `<!DOCTYPE html>
                 document.getElementById('conn_state_badge').innerText = d.conn_state;
                 document.getElementById('recv_state_badge').innerText = d.peer_receiver_state;
                 document.getElementById('hb_badge').innerText = d.last_heartbeat;
+                document.getElementById('local_ip_badge').innerText = d.local_ip + ":" + d.port;
+                document.getElementById('public_ip_badge').innerText = d.public_ip;
                 document.getElementById('local_recv_badge').innerText = "Local Receiver: " + d.local_receiver_state;
+
+                if (d.pairing_token) {
+                    const el = document.getElementById('my_token');
+                    el.setAttribute('data-token', d.pairing_token);
+                    if (tokenVisible) el.innerText = d.pairing_token;
+                }
 
                 if (d.peer_ip && d.peer_ip !== "—") {
                     document.getElementById('target_ip').value = d.peer_ip;
@@ -2448,7 +3060,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 document.getElementById('target_ip').value = d.peer_ip;
                 document.getElementById('prep_btn').disabled = false;
                 alertBox.className = 'alert-box success show';
-                alertBox.innerHTML = '<strong>✅ اتصال امن TLS 1.3 برقرار شد!</strong>شناسه سرور مقابل: <code>' + d.peer_server_id + '</code> | آدرس: <code>' + d.peer_ip + '</code>. اکنون دکمه «۱. آماده‌سازی شنونده گیرنده» را بزنید.';
+                alertBox.innerHTML = '<strong>✅ اتصال امن TLS 1.3 برقرار شد!</strong>شناسه سرور مقابل: <code>' + d.peer_server_id + '</code> | آدرس مقصد: <code>' + d.peer_ip + '</code> | IP عمومی سرور مقابل: <code>' + d.peer_public_ip + '</code>. اکنون دکمه «۱. آماده‌سازی شنونده گیرنده» را بزنید.';
             })
             .catch(err => {
                 alertBox.className = 'alert-box failure show';
@@ -2559,15 +3171,19 @@ func (s *AppServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	iface, err := s.ResolveOutgoingInterface(ctx, "8.8.8.8")
+	_ = s.RefreshLocalRouteInfo(ctx, "8.8.8.8")
 	cancel()
-	if err != nil {
-		iface = "eth0"
-	}
+
+	s.mu.RLock()
+	iface := s.LocalInterface
+	pubSource := s.PublicIPSource
+	s.mu.RUnlock()
 
 	data := DashboardData{
 		ServerID:        s.ServerID,
-		ServerIP:        s.ServerIP,
+		LocalIP:         s.EffectiveLocalIP(),
+		PublicIP:        s.EffectivePublicIP(),
+		PublicIPSource:  pubSource,
 		Port:            s.Port,
 		Iface:           iface,
 		CertFingerprint: s.CertFingerprint,
@@ -2682,32 +3298,44 @@ func serveMultiplexed(rawLn net.Listener, tlsCert tls.Certificate, handler http.
 	}
 }
 
-// Helpers for IP Discovery and Port Binding
-
-func getOutboundIP() string {
-	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 2*time.Second)
-	if err == nil {
-		defer conn.Close()
-		return conn.LocalAddr().(*net.UDPAddr).IP.String()
-	}
-	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("https://api.ipify.org")
-	if err == nil {
-		defer resp.Body.Close()
-		ip, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-		if err == nil {
-			trimmed := strings.TrimSpace(string(ip))
-			if isValidIPv4(trimmed) {
-				return trimmed
-			}
-		}
-	}
-	return "127.0.0.1"
-}
+// IP Validation & Classification Helpers
 
 func isValidIPv4(ipStr string) bool {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	return ip != nil && ip.To4() != nil
+}
+
+// isPublicIPv4 returns true only if ipStr is a valid, globally routable public IPv4 address.
+// It rejects private RFC1918, loopback, link-local, CGNAT (100.64.0.0/10), benchmarking, multicast, and reserved ranges.
+func isPublicIPv4(ipStr string) bool {
+	ip := net.ParseIP(strings.TrimSpace(ipStr))
+	if ip == nil {
+		return false
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	if ip4.IsLoopback() || ip4.IsPrivate() || ip4.IsLinkLocalUnicast() || ip4.IsLinkLocalMulticast() || ip4.IsMulticast() || ip4.IsUnspecified() {
+		return false
+	}
+	// RFC 6598 Shared Address Space (Carrier-Grade NAT): 100.64.0.0/10
+	if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+		return false
+	}
+	// RFC 6890 IETF Protocol Assignments: 192.0.0.0/24
+	if ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0 {
+		return false
+	}
+	// RFC 2544 Benchmarking: 198.18.0.0/15
+	if ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19) {
+		return false
+	}
+	// Reserved Class E (240.0.0.0/4) and Broadcast
+	if ip4[0] >= 240 {
+		return false
+	}
+	return true
 }
 
 func promptPortIfEmpty(cliPort string) string {
@@ -2757,6 +3385,7 @@ func (s *AppServer) Routes() http.Handler {
 	mux.HandleFunc("/", s.handleDashboard)
 
 	mux.HandleFunc("/api/admin/pair", s.requireAdminAuth(s.handleAdminPair))
+	mux.HandleFunc("/api/admin/public-ip", s.requireAdminAuth(s.handleAdminPublicIP))
 	mux.HandleFunc("/api/admin/prepare", s.requireAdminAuth(s.handleAdminPrepare))
 	mux.HandleFunc("/api/admin/test", s.requireAdminAuth(s.handleAdminTest))
 	mux.HandleFunc("/api/admin/status", s.requireAdminAuth(s.handleAdminStatus))
@@ -2780,6 +3409,7 @@ func (s *AppServer) Shutdown() {
 
 func main() {
 	cliPort := flag.String("port", "", "Port to run CheckSpoof on (default 8085)")
+	publicIPFlag := flag.String("public-ip", "", "Manually configured public IPv4 address for this server")
 	integrationPeer := flag.String("integration-peer", "", "Run real two-server VPS integration test against this peer token and exit")
 	spoofIPFlag := flag.String("spoof-ip", "8.8.8.8", "Spoofed source IPv4 address for -integration-peer mode")
 	methodFlag := flag.String("method", "udp", "Test method for -integration-peer mode (udp or icmp)")
@@ -2789,70 +3419,3 @@ func main() {
 	srv, err := NewAppServer(&RealCommandRunner{})
 	if err != nil {
 		fmt.Printf("[-] Initialization error: %v\n", err)
-		os.Exit(1)
-	}
-	srv.CleanupAllChains()
-
-	// Real Two-Server VPS CLI Integration Test Mode
-	if strings.TrimSpace(*integrationPeer) != "" {
-		srv.Port = "8085"
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
-		defer cancel()
-		defer srv.CleanupAllChains()
-
-		fmt.Println("======================================================================")
-		fmt.Printf("🔬 Running Real Two-Server VPS Integration Test (%s)\n", strings.ToUpper(*methodFlag))
-		fmt.Printf("📍 Local Sender IP : %s\n", srv.ServerIP)
-		fmt.Printf("🎭 Spoof Source IP : %s\n", *spoofIPFlag)
-		fmt.Println("======================================================================")
-
-		res, runErr := srv.RunRealVPSIntegrationTest(ctx, *integrationPeer, *spoofIPFlag, *methodFlag, *countFlag)
-		if runErr != nil {
-			fmt.Printf("[-] Integration test execution failed: %v\n", runErr)
-			os.Exit(1)
-		}
-
-		fmt.Printf("1. Receiver Listener Ready : %v\n", res.ReceiverListenerReady)
-		fmt.Printf("2. SNAT Rule Installed     : %v (Chain: %s, Outgoing Iface: %s)\n", res.SNATRuleInstalled, res.IsolatedChainName, res.OutgoingInterface)
-		fmt.Printf("3. Local Packet Generation : %v (%d/%d packets sent)\n", res.LocalPacketGenSuccess, res.PacketsSent, res.PacketsAttempted)
-		fmt.Printf("4. Local SNAT Rule Matched : %d packets (%d bytes)\n", res.SNATPacketsMatched, res.SNATBytesMatched)
-		fmt.Printf("5. Remote Spoof Verified   : %v (%d verified packets with spoofed IP %s)\n", res.RemoteSpoofVerified, res.RemoteVerifiedCount, *spoofIPFlag)
-		fmt.Printf("🏁 Final Classification    : %s\n", res.PrimaryClassification)
-		fmt.Printf("📋 Evidence                : %s\n", res.ConfirmedEvidence)
-
-		if res.PrimaryClassification == ClassSpoofSuccess && res.RemoteSpoofVerified {
-			os.Exit(0)
-		}
-		os.Exit(2)
-	}
-
-	preferredPort := promptPortIfEmpty(*cliPort)
-	listener, activePort := bindAvailableListener(preferredPort)
-	srv.Port = activePort
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Println("\n[+] Shutting down CheckSpoof and cleaning up temporary firewall chains...")
-		srv.Shutdown()
-		_ = listener.Close()
-		os.Exit(0)
-	}()
-
-	srv.StartHeartbeatLoop()
-	srv.AddLog(fmt.Sprintf("Node %s initialized on %s:%s (TLS Fingerprint=%s...)", srv.ServerID, srv.ServerIP, srv.Port, srv.CertFingerprint[:16]))
-
-	fmt.Println("======================================================================")
-	fmt.Printf("🛡️  CheckSpoof Enterprise v2 is running!\n")
-	fmt.Printf("🆔 Server ID        : %s\n", srv.ServerID)
-	fmt.Printf("🌐 Dashboard Login  : https://%s:%s/?key=%s\n", srv.ServerIP, srv.Port, srv.AdminKey)
-	fmt.Printf("🌐 HTTP Fallback    : http://%s:%s/?key=%s\n", srv.ServerIP, srv.Port, srv.AdminKey)
-	fmt.Printf("🔑 Admin Access Key : %s\n", srv.AdminKey)
-	fmt.Printf("🔗 Pairing Token    : %s\n", srv.PairingToken())
-	fmt.Println("======================================================================")
-
-	if err := serveMultiplexed(listener, srv.TLSCert, srv.Routes()); err != nil && !errors.Is(err, net.ErrClosed) {
-		fmt.Printf("[-] Server stopped: %v\n", err)
-	}
-}
