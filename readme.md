@@ -1,30 +1,181 @@
-# CheckSpoof — Two-Server IP Spoofing & Egress Filtering Diagnostic Tool
+# 🛡️ CheckSpoof — ابزار تشخیص BCP 38 و جعل آدرس IP با استفاده از دو سرور
 
-CheckSpoof is a two-server Linux diagnostic tool written in Go that measures whether packets with a spoofed source IPv4 address actually leave a sender server (`Server A`) and arrive intact at an independently controlled receiver server (`Server B`).
+**CheckSpoof** یک ابزار سبک برای عیب‌یابی شبکه در سیستم‌عامل لینوکس است که با استفاده از دو سرور مستقل، مشخص می‌کند آیا شبکه بالادستی سرور، مکانیزم اعتبارسنجی آدرس مبدأ (BCP 38 / Egress Filtering) را اعمال می‌کند یا خیر.
 
-## Strict Separation of Local Outbound IP vs. Public IP
-
-CheckSpoof strictly separates local routing interface addresses from public IPv4 addresses:
-
-- **`LocalOutboundIP` & `LocalInterface`**: Determined via `ip route get <destination>`, extracting both the actual outgoing network interface (`dev`) and kernel source address (`src`) for the specific target route.
-- **`PublicIP` (`MANUAL`, `DISCOVERED`, or `UNKNOWN`)**: Never assumed from the local interface address. If public IP discovery is unavailable, returns a private/CGNAT address, or yields conflicting results, `PublicIP` is explicitly reported as `UNKNOWN` rather than guessing.
-- **Manual Public IP Override**: Supported via `-public-ip <IPv4>`, the `PUBLIC_IP` environment variable, or the `/api/admin/public-ip` dashboard setting for servers behind NAT.
-
-## Strict Spoofing Verification Stages
-
-1. **`RECEIVER_LISTENER_READY`**: Server B has bound the target UDP (`:5555`) or raw ICMP (`ip4:icmp`) socket and confirmed readiness over the TLS 1.3 control channel.
-2. **`SNAT_RULE_INSTALLED`**: Server A created an isolated temporary `iptables` NAT chain (`CSPF_<ID>`) on the destination-specific outgoing interface and hooked it into `POSTROUTING`.
-3. **`LOCAL_PACKET_GENERATION_SUCCESS`**: Server A wrote the signed test packets to its local socket.
-4. **`LOCAL_FIREWALL_RULE_MATCHED`**: The kernel netfilter counter in `CSPF_<ID>` incremented.
-5. **`SPOOF_SUCCESS`**: Reported **only** when real OS commands are executed, addresses are non-loopback, the spoofed source IP differs from both Server A's local outbound IP and public IP, and Server B receives and cryptographically validates packets whose observed source IP matches the requested spoofed IP.
+برخلاف آزمایش‌های محلی، CheckSpoof دو سرور مستقل را از طریق یک کانال کنترلی احرازهویت‌شده مبتنی بر TLS 1.3 به یکدیگر متصل می‌کند و بررسی می‌کند که آیا بسته‌های تولیدشده با آدرس IP مبدأ جعلی، واقعاً از **سرور A (فرستنده)** خارج شده و بدون تغییر به **سرور B (گیرنده)** می‌رسند یا خیر.
 
 ---
 
-## Running & Configuring Public IP
+## ⚡ نصب سریع با یک دستور (SSH)
+
+این دستور را با دسترسی `root` روی **هر دو سرور لینوکسی** (Ubuntu/Debian) اجرا کنید:
 
 ```bash
-# Automatic discovery (reports UNKNOWN if behind NAT without external discovery):
-sudo checkspoof -port 8085
+sudo curl -sSL https://raw.githubusercontent.com/sahand363/checkspoof/main/install.sh | bash
+```
 
-# Explicit manual public IP (recommended for NAT/cloud environments):
-sudo checkspoof -port 8085 -public-ip 203.0.113.50
+### نصب مستقیم فایل اجرایی
+
+```bash
+sudo curl -L -f -o /usr/local/bin/checkspoof https://github.com/sahand363/checkspoof/releases/latest/download/checkspoof && sudo chmod +x /usr/local/bin/checkspoof
+```
+
+---
+
+## 🚀 راهنمای شروع سریع
+
+### مرحله ۱: راه‌اندازی سرور B (گیرنده)
+
+روی سروری که قرار است بسته‌ها را دریافت کند، CheckSpoof را با تعیین یک پورت آزاد اجرا کنید:
+
+```bash
+sudo checkspoof -port 8085
+```
+
+(اگر سرور پشت NAT یا در یک Cloud VPC قرار دارد، می‌توانید آدرس IP عمومی آن را نیز مشخص کنید: `-public-ip <YOUR_PUBLIC_IP>`)
+
+لینک ورود به داشبورد را که در خروجی ترمینال نمایش داده می‌شود، در مرورگر باز کنید.
+
+در بالای داشبورد، روی گزینه **کپی توکن (Copy Token)** کلیک کنید.
+
+### مرحله ۲: راه‌اندازی سرور A (فرستنده)
+
+روی سروری که قرار است بسته‌ها را ارسال کند، CheckSpoof را اجرا کنید:
+
+```bash
+sudo checkspoof -port 8085
+```
+
+لینک ورود به داشبورد سرور A را که در ترمینال نمایش داده می‌شود، در مرورگر باز کنید.
+
+### مرحله ۳: اتصال دو سرور و اجرای آزمایش
+
+**۱. اتصال (Connect):**
+
+در داشبورد سرور A، توکن سرور B را در فیلد **توکن سرور دوم (Receiver Token)** قرار دهید و روی گزینه **اتصال به سرور دوم (Connect)** کلیک کنید.
+
+**۲. فعال‌سازی حالت شنود (Listen - Receiver):**
+
+روی دکمه **📡 ۱. سرور دوم گوش بدهد (Listen)** کلیک کنید.
+
+وضعیت سرور B به شکل زیر تغییر خواهد کرد:
+
+🟢 `READY`
+
+هم‌زمان، در گزارش زنده سرور A پیام زیر نمایش داده می‌شود:
+
+🟢 `[Sender] This server is ready to send packets!`
+
+**۳. ارسال بسته‌های آزمایشی (Send - Sender):**
+
+روی دکمه **🚀 ۲. ارسال پکت‌های تست (Send)** کلیک کنید.
+
+در این مرحله، سرور A به‌صورت موقت یک قانون SNAT ایزوله در `iptables` ایجاد می‌کند، بسته‌های آزمایشی امضاشده را ارسال می‌کند و پس از اتمام آزمایش، قانون فایروال را به‌صورت خودکار پاک‌سازی می‌کند.
+
+سرور B محتوای بسته‌های دریافتی و آدرس IP مبدأ آن‌ها را با اطلاعات نشست و توکن مربوطه اعتبارسنجی می‌کند.
+
+---
+
+## 🔬 حالت اجرای خودکار از طریق CLI (Automated Integration Mode)
+
+امکان اجرای آزمایش‌های خودکار و بدون نیاز به تعامل با مرورگر، مستقیماً از طریق خط فرمان سرور A وجود دارد.
+
+نمونه دستور:
+
+```bash
+sudo checkspoof -integration-peer "SERVER_B_IP:8085|SERVER_ID|CERT_FP|SECRET" -spoof-ip 8.8.8.8 -method udp -count 3
+```
+
+### کدهای خروجی (Exit Codes)
+
+| کد | وضعیت | توضیحات |
+|---|---|---|
+| `0` | `SPOOF_SUCCESS` | سرور گیرنده بسته‌های دارای آدرس IP مبدأ جعلی را دریافت کرده و اعتبار رمزنگاری‌شده آن‌ها را تأیید کرده است. |
+| `2` | `REMOTE_PACKET_NOT_RECEIVED` | بسته‌ها در سرور مبدأ تولید شده و با قوانین SNAT مطابقت داشته‌اند، اما پیش از رسیدن به گیرنده از راه دور حذف شده‌اند. این وضعیت نشان‌دهنده شناسایی فیلترینگ خروجی یا محدودیت BCP 38 است. |
+| `1` | `ERROR` | خطا در اجرای آزمایش یا برقراری ارتباط. |
+
+---
+
+## 📊 مراحل آزمایش و شواهد (Result Stages & Evidence)
+
+CheckSpoof مراحل مختلف عبور بسته در شبکه را به‌صورت مجزا بررسی می‌کند تا از ثبت نتایج مثبت کاذب (False Positive) جلوگیری شود.
+
+| مرحله | وضعیت | توضیحات |
+|---|---|---|
+| ۱ | `RECEIVER_LISTENER_READY` | سرور B سوکت Raw یا شنونده UDP خود را با موفقیت راه‌اندازی و اعتبارسنجی کرده است. |
+| ۲ | `SNAT_RULE_INSTALLED` | سرور A یک زنجیره اختصاصی و محدود به نشست در `iptables` با پیشوند `CSPF_*` ایجاد کرده است. |
+| ۳ | `LOCAL_PACKET_GENERATION_SUCCESS` | بسته‌ها با موفقیت در سوکت شبکه محلی نوشته شده‌اند. |
+| ۴ | `LOCAL_FIREWALL_RULE_MATCHED` | شمارنده قوانین SNAT در Netfilter محلی افزایش یافته است (صرفاً در سطح کرنل). |
+| ۵ | `SPOOF_SUCCESS` | سرور B بسته‌هایی را مشاهده و اعتبارسنجی کرده است که دارای آدرس IP مبدأ جعلی موردنظر هستند. |
+
+**نکته مهم:**
+
+افزایش شمارنده SNAT یا موفقیت در آزمایش‌های Loopback هرگز به‌عنوان `SPOOF_SUCCESS` گزارش نمی‌شود.
+
+برای تأیید قطعی موفقیت، دریافت و اعتبارسنجی بسته‌ها از طریق سروری مستقل با IP عمومی متفاوت الزامی است.
+
+---
+
+## ⚙️ پارامترها و گزینه‌های خط فرمان (CLI Flags & Options)
+
+پارامترهای قابل استفاده در CheckSpoof:
+
+```text
+Usage of checkspoof:
+
+  -port string
+        پورت مورد استفاده برای داشبورد وب و کانال کنترلی TLS
+        (پیش‌فرض: 8085)
+
+  -public-ip string
+        تعیین صریح آدرس IPv4 عمومی
+        (مناسب برای سرورهای پشت NAT یا Cloud VPC)
+
+  -integration-peer string
+        اجرای آزمایش خودکار IP Spoofing از طریق CLI با استفاده از
+        توکن اتصال سرور مقابل و خروج از برنامه پس از اتمام آزمایش
+
+  -spoof-ip string
+        آدرس IPv4 هدف برای جعل آدرس مبدأ در حالت CLI Integration
+        (پیش‌فرض: 8.8.8.8)
+
+  -method string
+        پروتکل مورد استفاده در آزمایش CLI:
+        udp یا icmp
+        (پیش‌فرض: udp)
+
+  -count int
+        تعداد بسته‌های آزمایشی ارسالی:
+        از 1 تا 10
+        (پیش‌فرض: 3)
+```
+
+---
+
+## 🛠️ امنیت و ایزوله‌سازی قوانین فایروال (Security & Firewall Isolation)
+
+### ایزوله‌سازی در سطح پردازش (Strict Process Scoping)
+
+زنجیره‌های موقت `iptables` با استفاده از شناسه پردازش (PID) و شناسه نشست (Session ID) ایجاد می‌شوند.
+
+ساختار نام‌گذاری آن‌ها به شکل زیر است:
+
+```text
+CSPF_<PID>_<SESS>
+```
+
+توقف یک آزمایش یا پردازش، هیچ تأثیری بر نشست‌های هم‌زمان یا قوانین فایروال سایر برنامه‌ها نخواهد داشت.
+
+### بازیابی ایمن پس از توقف ناگهانی (Safe Crash Recovery)
+
+در صورت متوقف شدن ناگهانی یک نود، زنجیره‌های باقی‌مانده متعلق به پردازش‌های خاتمه‌یافته (Orphaned Chains) شناسایی می‌شوند.
+
+CheckSpoof در راه‌اندازی بعدی، با استفاده از یک ژورنال داخلی، این زنجیره‌های بلااستفاده را به‌صورت ایمن شناسایی و پاک‌سازی می‌کند.
+
+### ارتباط امن با Mutual TLS 1.3
+
+تمام ارتباطات کنترلی میان دو سرور رمزنگاری و احراز هویت می‌شوند.
+
+این فرایند با استفاده از TLS 1.3 و مکانیزم تثبیت اثر انگشت گواهی (SHA-256 Certificate Fingerprint Pinning) انجام می‌شود.
+
+این سازوکار از دسترسی غیرمجاز و ارسال دستورات کنترلی جعلی جلوگیری می‌کند.
