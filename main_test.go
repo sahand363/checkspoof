@@ -6,11 +6,13 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,29 +25,40 @@ type MockCommandCall struct {
 	Args []string
 }
 
+// MockCommandRunner simulates `ip route` and a stateful kernel `iptables -t nat` table
+// so multi-session, multi-process, and partial-initialization tests can verify exact NAT table state.
 type MockCommandRunner struct {
-	mu          sync.Mutex
-	Calls       []MockCommandCall
-	LastSpoofIP string
-	RouteFail   bool
-	PermFail    bool
-	RouteTable  map[string]string
+	mu               sync.Mutex
+	Calls            []MockCommandCall
+	LastSpoofIP      string
+	RouteFail        bool
+	PermFail         bool
+	FailOnAppend     bool
+	FailOnPostInsert bool
+	RouteTable       map[string]string
+	ChainSpoofIPs    map[string]string
+	NatChains        map[string][]string
+	PostroutingRules []string
 }
 
 func (m *MockCommandRunner) IsMock() bool {
 	return true
 }
 
+func (m *MockCommandRunner) ensureNatStateLocked() {
+	if m.ChainSpoofIPs == nil {
+		m.ChainSpoofIPs = make(map[string]string)
+	}
+	if m.NatChains == nil {
+		m.NatChains = make(map[string][]string)
+	}
+}
+
 func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) ([]byte, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.Calls = append(m.Calls, MockCommandCall{Name: name, Args: args})
-
-	for i, arg := range args {
-		if arg == "--to-source" && i+1 < len(args) {
-			m.LastSpoofIP = args[i+1]
-		}
-	}
+	m.ensureNatStateLocked()
+	m.Calls = append(m.Calls, MockCommandCall{Name: name, Args: append([]string(nil), args...)})
 
 	cmdLine := name + " " + strings.Join(args, " ")
 	if name == "ip" && strings.Contains(cmdLine, "route get") {
@@ -71,15 +84,84 @@ func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) 
 		if m.PermFail {
 			return []byte("iptables: Permission denied (you must be root)."), 4, context.DeadlineExceeded
 		}
-		if strings.Contains(cmdLine, "-L CSPF_") {
-			spoof := m.LastSpoofIP
-			if spoof == "" {
-				spoof = "8.8.8.8"
+
+		// Parse -t nat operations to maintain stateful simulated NAT table
+		if len(args) >= 4 && args[0] == "-t" && args[1] == "nat" {
+			op := args[2]
+			targetChain := args[3]
+
+			switch op {
+			case "-N":
+				if _, exists := m.NatChains[targetChain]; exists {
+					return []byte("iptables: Chain already exists."), 1, errors.New("chain already exists")
+				}
+				m.NatChains[targetChain] = []string{}
+				return []byte(""), 0, nil
+
+			case "-A":
+				if m.FailOnAppend {
+					return []byte("iptables: simulated rule append failure"), 1, errors.New("simulated append error")
+				}
+				ruleStr := strings.Join(args[4:], " ")
+				m.NatChains[targetChain] = append(m.NatChains[targetChain], ruleStr)
+				for i, arg := range args {
+					if arg == "--to-source" && i+1 < len(args) {
+						m.LastSpoofIP = args[i+1]
+						m.ChainSpoofIPs[targetChain] = args[i+1]
+					}
+				}
+				return []byte(""), 0, nil
+
+			case "-I":
+				if targetChain == "POSTROUTING" {
+					if m.FailOnPostInsert {
+						return []byte("iptables: simulated POSTROUTING insert failure"), 1, errors.New("simulated insert error")
+					}
+					jumpRule := strings.Join(args[5:], " ")
+					m.PostroutingRules = append([]string{jumpRule}, m.PostroutingRules...)
+				}
+				return []byte(""), 0, nil
+
+			case "-D":
+				if targetChain == "POSTROUTING" {
+					jumpRule := strings.Join(args[4:], " ")
+					filtered := make([]string, 0, len(m.PostroutingRules))
+					removed := false
+					for _, r := range m.PostroutingRules {
+						if !removed && r == jumpRule {
+							removed = true
+							continue
+						}
+						filtered = append(filtered, r)
+					}
+					m.PostroutingRules = filtered
+				}
+				return []byte(""), 0, nil
+
+			case "-F":
+				if _, exists := m.NatChains[targetChain]; exists {
+					m.NatChains[targetChain] = []string{}
+				}
+				return []byte(""), 0, nil
+
+			case "-X":
+				delete(m.NatChains, targetChain)
+				delete(m.ChainSpoofIPs, targetChain)
+				return []byte(""), 0, nil
+
+			case "-L":
+				spoof := m.ChainSpoofIPs[targetChain]
+				if spoof == "" {
+					spoof = m.LastSpoofIP
+				}
+				if spoof == "" {
+					spoof = "8.8.8.8"
+				}
+				out := fmt.Sprintf("Chain %s (1 references)\n"+
+					"    pkts      bytes target     prot opt in     out     source               destination\n"+
+					"       3      252 SNAT       all  --  *      eth0    0.0.0.0/0            127.0.0.1            to:%s\n", targetChain, spoof)
+				return []byte(out), 0, nil
 			}
-			out := fmt.Sprintf("Chain CSPF_TEST (1 references)\n"+
-				"    pkts      bytes target     prot opt in     out     source               destination\n"+
-				"       3      252 SNAT       all  --  *      eth0    0.0.0.0/0            127.0.0.1            to:%s\n", spoof)
-			return []byte(out), 0, nil
 		}
 		return []byte(""), 0, nil
 	}
@@ -89,6 +171,25 @@ func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) 
 	}
 
 	return []byte(""), 0, nil
+}
+
+func (m *MockCommandRunner) HasChain(chainName string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.NatChains[chainName]
+	return ok
+}
+
+func (m *MockCommandRunner) HasPostroutingJumpTo(chainName string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	suffix := "-j " + chainName
+	for _, r := range m.PostroutingRules {
+		if strings.HasSuffix(r, suffix) || strings.Contains(r, suffix+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 func findFreeUDPPort(t *testing.T) int {
@@ -209,7 +310,7 @@ func TestICMPPacketVerification(t *testing.T) {
 	}
 }
 
-// 3. Test Isolated SNAT Chain Creation, Counter Parsing & Guaranteed Cleanup
+// 3. Test Isolated SNAT Chain Creation, Process/Session Scoping, Counter Parsing & Cleanup
 func TestIsolatedSNATChainLifecycle(t *testing.T) {
 	mockRunner := &MockCommandRunner{}
 	srv, err := NewAppServer(mockRunner)
@@ -222,8 +323,12 @@ func TestIsolatedSNATChainLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SetupIsolatedSNATChain failed: %v", err)
 	}
-	if iso.ChainName != "CSPF_A1B2C3D4" {
-		t.Fatalf("expected chain name CSPF_A1B2C3D4, got %s", iso.ChainName)
+	expectedChain := fmt.Sprintf("CSPF_%s_A1B2C3D4", srv.InstanceChainID)
+	if iso.ChainName != expectedChain {
+		t.Fatalf("expected process+session scoped chain name %s, got %s", expectedChain, iso.ChainName)
+	}
+	if len(iso.ChainName) > 28 {
+		t.Fatalf("chain name %s exceeds Linux 28-char iptables limit", iso.ChainName)
 	}
 
 	pkts, bCount, _, err := iso.ReadCounters(ctx)
@@ -233,25 +338,191 @@ func TestIsolatedSNATChainLifecycle(t *testing.T) {
 
 	iso.Cleanup()
 
-	var sawDeleteJump, sawFlush, sawDeleteChain bool
-	for _, c := range mockRunner.Calls {
-		joined := strings.Join(c.Args, " ")
-		if strings.Contains(joined, "-D POSTROUTING") && strings.Contains(joined, "CSPF_A1B2C3D4") {
-			sawDeleteJump = true
-		}
-		if strings.Contains(joined, "-F CSPF_A1B2C3D4") {
-			sawFlush = true
-		}
-		if strings.Contains(joined, "-X CSPF_A1B2C3D4") {
-			sawDeleteChain = true
-		}
+	if mockRunner.HasChain(expectedChain) {
+		t.Fatalf("expected chain %s to be deleted after Cleanup()", expectedChain)
 	}
-	if !sawDeleteJump || !sawFlush || !sawDeleteChain {
-		t.Fatalf("incomplete cleanup: deleteJump=%v, flush=%v, deleteChain=%v", sawDeleteJump, sawFlush, sawDeleteChain)
+	if mockRunner.HasPostroutingJumpTo(expectedChain) {
+		t.Fatalf("expected POSTROUTING jump to %s to be deleted after Cleanup()", expectedChain)
 	}
 }
 
-// 4. Test Loopback & Mocked Firewall Control Flow:
+// 4. Test Multi-Session & Multi-Process SNAT Chain Isolation:
+// Proves that cleaning up one session or one CheckSpoof process NEVER deletes
+// another active session's SNAT chains, jump rules, or unrelated firewall rules.
+func TestSNATChainIsolation_PreservesOtherSessionsAndProcesses(t *testing.T) {
+	sharedKernelNAT := &MockCommandRunner{
+		NatChains: map[string][]string{
+			"DOCKER":              {"-o docker0 -j MASQUERADE"},
+			"CSPF_FOREIGN_999999": {"-o eth0 -d 198.51.100.1 -p udp --dport 5555 -j SNAT --to-source 1.1.1.1"},
+		},
+		PostroutingRules: []string{
+			"-o docker0 -j DOCKER",
+			"-o eth0 -d 198.51.100.1 -p udp --dport 5555 -j CSPF_FOREIGN_999999",
+		},
+	}
+
+	srv1, err := NewAppServer(sharedKernelNAT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv2, err := NewAppServer(sharedKernelNAT)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Create two concurrent sessions on srv1 and one active session on srv2
+	iso1A, err := srv1.SetupIsolatedSNATChain(ctx, "1111aaaa", "eth0", "203.0.113.10", "8.8.8.8", "icmp", 0)
+	if err != nil {
+		t.Fatalf("srv1 session A setup failed: %v", err)
+	}
+	iso1B, err := srv1.SetupIsolatedSNATChain(ctx, "2222bbbb", "eth0", "203.0.113.10", "9.9.9.9", "udp", 5555)
+	if err != nil {
+		t.Fatalf("srv1 session B setup failed: %v", err)
+	}
+	iso2A, err := srv2.SetupIsolatedSNATChain(ctx, "1111aaaa", "eth0", "203.0.113.20", "1.1.1.1", "icmp", 0)
+	if err != nil {
+		t.Fatalf("srv2 session A setup failed: %v", err)
+	}
+
+	if iso1A.ChainName == iso1B.ChainName || iso1A.ChainName == iso2A.ChainName {
+		t.Fatalf("expected unique chain names across sessions and processes, got %s, %s, %s",
+			iso1A.ChainName, iso1B.ChainName, iso2A.ChainName)
+	}
+
+	// Step A: Clean up Session 1A on srv1. Session 1B, srv2's Session 2A, CSPF_FOREIGN_999999, and DOCKER must remain intact.
+	iso1A.Cleanup()
+	// Repeated Cleanup() must be a safe no-op
+	iso1A.Cleanup()
+
+	if sharedKernelNAT.HasChain(iso1A.ChainName) || sharedKernelNAT.HasPostroutingJumpTo(iso1A.ChainName) {
+		t.Fatalf("expected iso1A (%s) to be removed", iso1A.ChainName)
+	}
+	if !sharedKernelNAT.HasChain(iso1B.ChainName) || !sharedKernelNAT.HasPostroutingJumpTo(iso1B.ChainName) {
+		t.Fatalf("cleaning up iso1A broke active sibling session iso1B (%s)!", iso1B.ChainName)
+	}
+	if !sharedKernelNAT.HasChain(iso2A.ChainName) || !sharedKernelNAT.HasPostroutingJumpTo(iso2A.ChainName) {
+		t.Fatalf("cleaning up iso1A broke another process's active session iso2A (%s)!", iso2A.ChainName)
+	}
+	if !sharedKernelNAT.HasChain("CSPF_FOREIGN_999999") || !sharedKernelNAT.HasPostroutingJumpTo("CSPF_FOREIGN_999999") {
+		t.Fatal("cleaning up iso1A deleted an unowned CSPF_FOREIGN_999999 chain!")
+	}
+	if !sharedKernelNAT.HasChain("DOCKER") || !sharedKernelNAT.HasPostroutingJumpTo("DOCKER") {
+		t.Fatal("cleaning up iso1A deleted unrelated DOCKER firewall rules!")
+	}
+
+	// Step B: Call srv1.CleanupAllChains() (e.g. srv1 shutting down).
+	// Must remove srv1's remaining iso1B, but MUST NOT touch srv2's iso2A, CSPF_FOREIGN_999999, or DOCKER.
+	srv1.CleanupAllChains()
+
+	if sharedKernelNAT.HasChain(iso1B.ChainName) || sharedKernelNAT.HasPostroutingJumpTo(iso1B.ChainName) {
+		t.Fatalf("expected srv1.CleanupAllChains() to remove iso1B (%s)", iso1B.ChainName)
+	}
+	if !sharedKernelNAT.HasChain(iso2A.ChainName) || !sharedKernelNAT.HasPostroutingJumpTo(iso2A.ChainName) {
+		t.Fatalf("srv1.CleanupAllChains() deleted srv2's active chain %s!", iso2A.ChainName)
+	}
+	if !sharedKernelNAT.HasChain("CSPF_FOREIGN_999999") || !sharedKernelNAT.HasPostroutingJumpTo("CSPF_FOREIGN_999999") {
+		t.Fatal("srv1.CleanupAllChains() deleted foreign CSPF_FOREIGN_999999 chain!")
+	}
+	if !sharedKernelNAT.HasChain("DOCKER") || !sharedKernelNAT.HasPostroutingJumpTo("DOCKER") {
+		t.Fatal("srv1.CleanupAllChains() deleted unrelated DOCKER chain!")
+	}
+
+	// Step C: Clean up srv2
+	srv2.CleanupAllChains()
+	if sharedKernelNAT.HasChain(iso2A.ChainName) || sharedKernelNAT.HasPostroutingJumpTo(iso2A.ChainName) {
+		t.Fatalf("expected srv2.CleanupAllChains() to remove iso2A (%s)", iso2A.ChainName)
+	}
+	if !sharedKernelNAT.HasChain("CSPF_FOREIGN_999999") || !sharedKernelNAT.HasChain("DOCKER") {
+		t.Fatal("srv2.CleanupAllChains() deleted unowned chains!")
+	}
+}
+
+// 5. Test Partial Initialization Rollback & Crash Journal Recovery
+func TestSNATChainPartialInitAndCrashJournalRecovery(t *testing.T) {
+	mockNAT := &MockCommandRunner{}
+	srv, err := NewAppServer(mockNAT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Create a healthy active session first
+	activeIso, err := srv.SetupIsolatedSNATChain(ctx, "active01", "eth0", "203.0.113.10", "8.8.8.8", "icmp", 0)
+	if err != nil {
+		t.Fatalf("failed to create activeIso: %v", err)
+	}
+
+	// Simulate failure during POSTROUTING jump insertion (-N and -A succeed, -I fails)
+	mockNAT.FailOnPostInsert = true
+	_, err = srv.SetupIsolatedSNATChain(ctx, "partfail", "eth0", "203.0.113.10", "1.1.1.1", "icmp", 0)
+	if err == nil {
+		t.Fatal("expected SetupIsolatedSNATChain to fail when POSTROUTING insert fails")
+	}
+	mockNAT.FailOnPostInsert = false
+
+	failedChain := srv.BuildSNATChainName("partfail")
+	if mockNAT.HasChain(failedChain) || mockNAT.HasPostroutingJumpTo(failedChain) {
+		t.Fatalf("partial initialization did not roll back chain %s", failedChain)
+	}
+	if !mockNAT.HasChain(activeIso.ChainName) || !mockNAT.HasPostroutingJumpTo(activeIso.ChainName) {
+		t.Fatalf("partial initialization rollback disturbed active session %s!", activeIso.ChainName)
+	}
+
+	// Test crash journal recovery: dead PID entry is cleaned up while live PID entry (os.Getpid()) is preserved
+	tmpJournal := filepath.Join(t.TempDir(), "cspf_journal.json")
+	srv.JournalPath = tmpJournal
+
+	deadChain := "CSPF_DEAD01_CAFEBABE"
+	deadJump := []string{"-o", "eth0", "-d", "203.0.113.55", "-p", "icmp", "-j", deadChain}
+	mockNAT.mu.Lock()
+	mockNAT.NatChains[deadChain] = []string{"-o eth0 -j SNAT --to-source 9.9.9.9"}
+	mockNAT.PostroutingRules = append(mockNAT.PostroutingRules, strings.Join(deadJump, " "))
+	mockNAT.mu.Unlock()
+
+	journalEntries := []CrashJournalEntry{
+		{
+			PID:          999999, // Dead/non-existent PID
+			InstanceID:   "DEAD01",
+			SessionID:    "cafebabe",
+			ChainName:    deadChain,
+			JumpArgs:     deadJump,
+			ChainCreated: true,
+			RuleAdded:    true,
+			JumpInserted: true,
+		},
+		{
+			PID:          os.Getpid(), // Live current process PID
+			InstanceID:   srv.InstanceChainID,
+			SessionID:    "active01",
+			ChainName:    activeIso.ChainName,
+			JumpArgs:     activeIso.JumpArgs,
+			ChainCreated: true,
+			RuleAdded:    true,
+			JumpInserted: true,
+		},
+	}
+	rawJournal, _ := json.Marshal(journalEntries)
+	if err := os.WriteFile(tmpJournal, rawJournal, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := srv.RecoverOrphanedChainsFromJournal(ctx)
+	if recovered != 1 {
+		t.Fatalf("expected 1 dead-PID chain to be recovered, got %d", recovered)
+	}
+	if mockNAT.HasChain(deadChain) || mockNAT.HasPostroutingJumpTo(deadChain) {
+		t.Fatalf("expected dead-PID chain %s to be cleaned up", deadChain)
+	}
+	if !mockNAT.HasChain(activeIso.ChainName) || !mockNAT.HasPostroutingJumpTo(activeIso.ChainName) {
+		t.Fatalf("journal recovery deleted live-PID chain %s!", activeIso.ChainName)
+	}
+
+	activeIso.Cleanup()
+}
+
+// 6. Test Loopback & Mocked Firewall Control Flow:
 // Verifies TLS pairing, receiver readiness, and packet framing, AND proves that
 // loopback (127.0.0.1) or mocked iptables NEVER falsely reports SPOOF_SUCCESS.
 func TestLocalControlFlowAndPacketFraming_LoopbackMocked_DoesNotClaimSpoofSuccess(t *testing.T) {
@@ -364,7 +635,7 @@ func TestLocalControlFlowAndPacketFraming_LoopbackMocked_DoesNotClaimSpoofSucces
 	}
 }
 
-// 5. Test Genuine Spoof Setup Guard (Rejects Loopback, Mock Runner, LocalOutboundIP, and PublicIP)
+// 7. Test Genuine Spoof Setup Guard (Rejects Loopback, Mock Runner, LocalOutboundIP, and PublicIP)
 func TestGenuineSpoofSetupGuard(t *testing.T) {
 	srvMock, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -404,7 +675,7 @@ func TestGenuineSpoofSetupGuard(t *testing.T) {
 	}
 }
 
-// 6. Test Route Selection & `ip route get` Parsing (Outgoing Interface + Source IP)
+// 8. Test Route Selection & `ip route get` Parsing (Outgoing Interface + Source IP)
 func TestParseIPRouteGetOutput_AndDestinationRouteSelection(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -470,7 +741,6 @@ func TestParseIPRouteGetOutput_AndDestinationRouteSelection(t *testing.T) {
 		})
 	}
 
-	// Destination-specific route selection on a multi-interface server
 	mockRunner := &MockCommandRunner{
 		RouteTable: map[string]string{
 			"8.8.8.8":      "8.8.8.8 via 10.0.0.1 dev eth0 src 10.0.0.15 uid 0",
@@ -490,7 +760,7 @@ func TestParseIPRouteGetOutput_AndDestinationRouteSelection(t *testing.T) {
 	}
 }
 
-// 7. Test Private, CGNAT, Loopback, and Public IPv4 Classification
+// 9. Test Private, CGNAT, Loopback, and Public IPv4 Classification
 func TestPrivateAndReservedIPv4Classification(t *testing.T) {
 	privateOrReserved := []string{
 		"127.0.0.1",
@@ -526,12 +796,10 @@ func TestPrivateAndReservedIPv4Classification(t *testing.T) {
 	}
 }
 
-// 8. Test Public IP Detection, NAT Separation, UNKNOWN Fallback, and Manual Public IP Configuration
+// 10. Test Public IP Detection, NAT Separation, UNKNOWN Fallback, and Manual Public IP Configuration
 func TestPublicIPDetection_NAT_Unknown_AndManualOverride(t *testing.T) {
 	_ = os.Unsetenv("PUBLIC_IP")
 
-	// Scenario A: Behind NAT (LocalOutboundIP = 10.0.0.15), no public IP discovery run yet.
-	// Must never assume LocalOutboundIP (10.0.0.15) is the PublicIP!
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
 		t.Fatal(err)
@@ -546,7 +814,6 @@ func TestPublicIPDetection_NAT_Unknown_AndManualOverride(t *testing.T) {
 		t.Fatal("expected BehindNAT=true when LocalOutboundIP is RFC1918 10.0.0.15")
 	}
 
-	// Scenario B: Discovery endpoints return conflicting public IPs -> uncertain -> must report UNKNOWN
 	ep1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("203.0.113.10\n"))
 	}))
@@ -564,7 +831,6 @@ func TestPublicIPDetection_NAT_Unknown_AndManualOverride(t *testing.T) {
 			gotIP, srv.PublicIP, err)
 	}
 
-	// Scenario C: Discovery endpoint returns a private RFC1918 IP -> must reject and report UNKNOWN
 	epPrivate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("192.168.1.250"))
 	}))
@@ -575,7 +841,6 @@ func TestPublicIPDetection_NAT_Unknown_AndManualOverride(t *testing.T) {
 		t.Fatalf("expected private IP from discovery endpoint to be rejected as UNKNOWN, got %s (err=%v)", gotIP, err)
 	}
 
-	// Scenario D: Discovery endpoints agree on a valid public IP -> LocalOutboundIP stays 10.0.0.15, PublicIP becomes 203.0.113.10
 	epConsistent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("203.0.113.10\n"))
 	}))
@@ -590,7 +855,6 @@ func TestPublicIPDetection_NAT_Unknown_AndManualOverride(t *testing.T) {
 			srv.LocalOutboundIP, srv.PublicIP, srv.PublicIPSource, srv.BehindNAT)
 	}
 
-	// Scenario E: Manual Public IP configuration rejects private/loopback IPs and accepts valid public IPs
 	if err := srv.SetManualPublicIP("10.0.0.99"); err == nil {
 		t.Fatal("expected SetManualPublicIP to reject private RFC1918 IP 10.0.0.99")
 	}
@@ -608,7 +872,7 @@ func TestPublicIPDetection_NAT_Unknown_AndManualOverride(t *testing.T) {
 	}
 }
 
-// 9. Real Two-Server VPS Integration Test Mode
+// 11. Real Two-Server VPS Integration Test Mode
 func TestRealTwoServerVPSIntegration(t *testing.T) {
 	peerToken := strings.TrimSpace(os.Getenv("CHECKSPOOF_PEER_TOKEN"))
 	spoofIP := strings.TrimSpace(os.Getenv("CHECKSPOOF_SPOOF_IP"))
@@ -654,7 +918,7 @@ func TestRealTwoServerVPSIntegration(t *testing.T) {
 	}
 }
 
-// 10. Regression Test (Case A): Replacing an active receiver session must not deadlock
+// 12. Regression Test (Case A): Replacing an active receiver session must not deadlock
 func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -743,7 +1007,7 @@ func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 	}
 }
 
-// 11. Regression Test (Case B): Concurrent StartReceiverSession calls must serialize cleanly
+// 13. Regression Test (Case B): Concurrent StartReceiverSession calls must serialize cleanly
 func TestRegression_ConcurrentStartReceiverSession(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -840,7 +1104,7 @@ func TestRegression_ConcurrentStartReceiverSession(t *testing.T) {
 	}
 }
 
-// 12. Regression Test (Case C): Cancelling a receiver session during listener startup
+// 14. Regression Test (Case C): Cancelling a receiver session during listener startup
 func TestRegression_CancelDuringStartup(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -933,7 +1197,7 @@ func TestRegression_CancelDuringStartup(t *testing.T) {
 	}
 }
 
-// 13. Regression Test (Case D): Repeated concurrent cancellation during shutdown is idempotent
+// 15. Regression Test (Case D): Repeated concurrent cancellation during shutdown is idempotent
 func TestRegression_RepeatedCancellationDuringShutdown(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -1001,7 +1265,7 @@ func TestRegression_RepeatedCancellationDuringShutdown(t *testing.T) {
 	}
 }
 
-// 14. Regression Test (Case E): Old session cleanup cannot overwrite newer session's state
+// 16. Regression Test (Case E): Old session cleanup cannot overwrite newer session's state
 func TestRegression_OldSessionCleanupCannotOverwriteNewSessionState(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
