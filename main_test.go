@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,10 @@ type MockCommandRunner struct {
 	LastSpoofIP string
 	RouteFail   bool
 	PermFail    bool
+}
+
+func (m *MockCommandRunner) IsMock() bool {
+	return true
 }
 
 func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) ([]byte, int, error) {
@@ -72,7 +77,6 @@ func (m *MockCommandRunner) Run(_ context.Context, name string, args ...string) 
 	return []byte(""), 0, nil
 }
 
-// findFreeUDPPort reserves and releases an available local UDP port for deterministic tests.
 func findFreeUDPPort(t *testing.T) int {
 	t.Helper()
 	addr, err := net.ResolveUDPAddr("udp4", "127.0.0.1:0")
@@ -88,7 +92,6 @@ func findFreeUDPPort(t *testing.T) int {
 	return port
 }
 
-// trackedPacketConn wraps net.PacketConn to count Close() invocations deterministically.
 type trackedPacketConn struct {
 	net.PacketConn
 	closeOnce   sync.Once
@@ -104,8 +107,6 @@ func (c *trackedPacketConn) Close() error {
 	return err
 }
 
-// ControlledStartupBinder coordinates listener binding via channels (zero sleeps)
-// to test cancellation during startup and concurrent preparation deterministically.
 type ControlledStartupBinder struct {
 	bindEntered chan struct{}
 	bindRelease chan struct{}
@@ -236,8 +237,10 @@ func TestIsolatedSNATChainLifecycle(t *testing.T) {
 	}
 }
 
-// 4. Test Two-Server TLS 1.3 Pairing, Receiver Readiness Handshake, and End-to-End UDP Verification
-func TestEndToEndTwoServerReadinessAndUDPVerification(t *testing.T) {
+// 4. Test Loopback & Mocked Firewall Control Flow:
+// Verifies TLS pairing, receiver readiness, and packet framing, AND proves that
+// loopback (127.0.0.1) or mocked iptables NEVER falsely reports SPOOF_SUCCESS.
+func TestLocalControlFlowAndPacketFraming_LoopbackMocked_DoesNotClaimSpoofSuccess(t *testing.T) {
 	runnerA := &MockCommandRunner{}
 	runnerB := &MockCommandRunner{}
 
@@ -332,15 +335,107 @@ func TestEndToEndTwoServerReadinessAndUDPVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if testRes.PrimaryClassification != ClassRemoteVerified {
-		t.Fatalf("expected REMOTE_PACKET_VERIFIED, got %s (%s)", testRes.PrimaryClassification, testRes.ConfirmedEvidence)
+	// Verify separated stage flags
+	if !testRes.ReceiverListenerReady || !testRes.SNATRuleInstalled || !testRes.LocalPacketGenSuccess {
+		t.Fatalf("expected local & readiness stages to succeed, got ready=%v, snat=%v, localGen=%v",
+			testRes.ReceiverListenerReady, testRes.SNATRuleInstalled, testRes.LocalPacketGenSuccess)
 	}
-	if testRes.PacketsSent != 3 || testRes.RemoteVerifiedCount != 3 {
-		t.Fatalf("expected 3 sent and 3 verified packets, got sent=%d, verified=%d", testRes.PacketsSent, testRes.RemoteVerifiedCount)
+
+	// CRITICAL ASSERTION: Loopback/mocked execution must NEVER report SPOOF_SUCCESS or RemoteSpoofVerified=true
+	if testRes.PrimaryClassification == ClassSpoofSuccess || testRes.RemoteSpoofVerified {
+		t.Fatalf("SECURITY/VERIFICATION BUG: loopback or mocked test falsely reported SPOOF_SUCCESS! got classification=%s, RemoteSpoofVerified=%v",
+			testRes.PrimaryClassification, testRes.RemoteSpoofVerified)
+	}
+	if testRes.PrimaryClassification != ClassSimulatedControlVerified || !testRes.IsLoopbackOrSimulated {
+		t.Fatalf("expected SIMULATED_CONTROL_FLOW_VERIFIED with IsLoopbackOrSimulated=true, got %s (isLoopback=%v)",
+			testRes.PrimaryClassification, testRes.IsLoopbackOrSimulated)
 	}
 }
 
-// 5. Regression Test (Case A): Replacing an active receiver session must not deadlock
+// 5. Test Genuine Spoof Setup Guard (Rejects Loopback, Mock Runner, and Unspoofed Sender IP)
+func TestGenuineSpoofSetupGuard(t *testing.T) {
+	// Case 1: Mock runner must always be rejected for SPOOF_SUCCESS
+	srvMock, err := NewAppServer(&MockCommandRunner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvMock.ServerIP = "198.51.100.10"
+	if ok, _ := srvMock.isGenuineNetworkSpoofSetup("203.0.113.20", "8.8.8.8"); ok {
+		t.Fatal("expected MockCommandRunner to be rejected as non-genuine network spoof setup")
+	}
+
+	// Case 2: Real runner, but loopback target or spoof IP must be rejected
+	srvReal, err := NewAppServer(&RealCommandRunner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvReal.ServerIP = "198.51.100.10"
+	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("127.0.0.1", "8.8.8.8"); ok {
+		t.Fatal("expected loopback target 127.0.0.1 to be rejected")
+	}
+	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "127.0.0.1"); ok {
+		t.Fatal("expected loopback spoof IP 127.0.0.1 to be rejected")
+	}
+
+	// Case 3: Real runner, non-loopback, but SpoofIP == SenderIP (no actual spoofing) must be rejected
+	if ok, _ := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "198.51.100.10"); ok {
+		t.Fatal("expected unspoofed IP (SpoofIP == SenderIP) to be rejected")
+	}
+
+	// Case 4: Real runner, distinct public SenderIP, TargetIP, and SpoofIP -> valid genuine setup
+	if ok, reason := srvReal.isGenuineNetworkSpoofSetup("203.0.113.20", "8.8.8.8"); !ok {
+		t.Fatalf("expected valid two-VPS setup to pass guard, got rejection: %s", reason)
+	}
+}
+
+// 6. Real Two-Server VPS Integration Test Mode
+// Executes only when CHECKSPOOF_PEER_TOKEN is provided on an authorized Linux VPS.
+func TestRealTwoServerVPSIntegration(t *testing.T) {
+	peerToken := strings.TrimSpace(os.Getenv("CHECKSPOOF_PEER_TOKEN"))
+	spoofIP := strings.TrimSpace(os.Getenv("CHECKSPOOF_SPOOF_IP"))
+	method := strings.TrimSpace(os.Getenv("CHECKSPOOF_METHOD"))
+
+	if peerToken == "" {
+		t.Skip("Skipping real two-VPS integration test: set CHECKSPOOF_PEER_TOKEN and CHECKSPOOF_SPOOF_IP to run against a live remote receiver VPS.")
+	}
+	if spoofIP == "" {
+		spoofIP = "8.8.8.8"
+	}
+	if method == "" {
+		method = "udp"
+	}
+
+	srv, err := NewAppServer(&RealCommandRunner{})
+	if err != nil {
+		t.Fatalf("failed to initialize real AppServer: %v", err)
+	}
+	srv.Port = "8085"
+	defer srv.Shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	res, err := srv.RunRealVPSIntegrationTest(ctx, peerToken, spoofIP, method, 3)
+	if err != nil {
+		t.Fatalf("real two-VPS integration test failed: %v", err)
+	}
+
+	t.Logf("Stage 1 [ReceiverListenerReady] : %v", res.ReceiverListenerReady)
+	t.Logf("Stage 2 [SNATRuleInstalled]     : %v (Chain=%s, Iface=%s)", res.SNATRuleInstalled, res.IsolatedChainName, res.OutgoingInterface)
+	t.Logf("Stage 3 [LocalPacketGenSuccess] : %v (%d/%d sent)", res.LocalPacketGenSuccess, res.PacketsSent, res.PacketsAttempted)
+	t.Logf("Stage 4 [SNATPacketsMatched]    : %d pkts (%d bytes)", res.SNATPacketsMatched, res.SNATBytesMatched)
+	t.Logf("Stage 5 [RemoteSpoofVerified]   : %v (%d verified packets arriving with source IP %s)", res.RemoteSpoofVerified, res.RemoteVerifiedCount, spoofIP)
+	t.Logf("Final Verdict                   : %s — %s", res.PrimaryClassification, res.ConfirmedEvidence)
+
+	if res.IsLoopbackOrSimulated {
+		t.Fatalf("real VPS integration test must not use loopback or simulated runner: %s", res.ConfirmedEvidence)
+	}
+	if !res.ReceiverListenerReady || !res.SNATRuleInstalled || !res.LocalPacketGenSuccess {
+		t.Fatalf("local sender or remote listener setup failed: %+v", res)
+	}
+}
+
+// 7. Regression Test (Case A): Replacing an active receiver session must not deadlock
 func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -371,7 +466,6 @@ func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 		t.Fatal("sess1 not registered as active session")
 	}
 
-	// Repeatedly replace the active session on the exact same UDP port with a strict timeout
 	done := make(chan error, 1)
 	var lastSessID string
 	go func() {
@@ -408,7 +502,6 @@ func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 		t.Fatal("DEADLOCK DETECTED: StartReceiverSession hung when replacing an active receiver session")
 	}
 
-	// Verify sess1 was cleanly stopped and closed
 	select {
 	case <-sess1.DoneChan:
 	default:
@@ -418,7 +511,6 @@ func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 		t.Fatalf("expected sess1 state RecvCompleted, got %s", st)
 	}
 
-	// Verify the latest session is active and server state is READY_TO_RECEIVE
 	srv.mu.RLock()
 	activeSess := srv.ActiveRecvSession
 	serverRecvState := srv.LocalReceiverState
@@ -432,7 +524,7 @@ func TestRegression_ReplaceActiveReceiverSession_NoDeadlock(t *testing.T) {
 	}
 }
 
-// 6. Regression Test (Case B): Concurrent StartReceiverSession calls must serialize cleanly
+// 8. Regression Test (Case B): Concurrent StartReceiverSession calls must serialize cleanly
 func TestRegression_ConcurrentStartReceiverSession(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -489,8 +581,6 @@ func TestRegression_ConcurrentStartReceiverSession(t *testing.T) {
 		t.Fatalf("concurrent StartReceiverSession error: %v", e)
 	}
 
-	// Verify deterministic final state: exactly 1 session is active and READY_TO_RECEIVE,
-	// and all other (workers - 1) sessions in SessionHistory are stopped.
 	srv.mu.RLock()
 	active := srv.ActiveRecvSession
 	localState := srv.LocalReceiverState
@@ -531,7 +621,7 @@ func TestRegression_ConcurrentStartReceiverSession(t *testing.T) {
 	}
 }
 
-// 7. Regression Test (Case C): Cancelling a receiver session during listener startup
+// 9. Regression Test (Case C): Cancelling a receiver session during listener startup
 func TestRegression_CancelDuringStartup(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -567,7 +657,6 @@ func TestRegression_CancelDuringStartup(t *testing.T) {
 		resCh <- startResult{resp: r, err: sErr}
 	}()
 
-	// Deterministically wait until ListenUDP is in progress
 	select {
 	case <-binder.bindEntered:
 	case <-time.After(2 * time.Second):
@@ -583,13 +672,11 @@ func TestRegression_CancelDuringStartup(t *testing.T) {
 		t.Fatalf("expected RECEIVER_INITIALIZING during startup, got state=%s, sess=%v", midState, initializingSess)
 	}
 
-	// Cancel the session while initialization is still paused inside ListenUDP
 	cancelDone := make(chan bool, 1)
 	go func() {
 		cancelDone <- srv.CancelReceiverSession(req.SessionID)
 	}()
 
-	// Wait until sess.IsCancelled() is observed, then release ListenUDP
 	for !initializingSess.IsCancelled() {
 		time.Sleep(1 * time.Millisecond)
 	}
@@ -613,7 +700,6 @@ func TestRegression_CancelDuringStartup(t *testing.T) {
 		t.Fatal("CancelReceiverSession hung waiting for startup cancellation")
 	}
 
-	// Verify partial socket resource was closed and server state is IDLE (not READY_TO_RECEIVE)
 	if closed := atomic.LoadInt32(&binder.closedCount); closed != 1 {
 		t.Fatalf("expected partially bound UDP socket to be closed once, got closedCount=%d", closed)
 	}
@@ -628,7 +714,7 @@ func TestRegression_CancelDuringStartup(t *testing.T) {
 	}
 }
 
-// 8. Regression Test (Case D): Repeated concurrent cancellation during shutdown is idempotent
+// 10. Regression Test (Case D): Repeated concurrent cancellation during shutdown is idempotent
 func TestRegression_RepeatedCancellationDuringShutdown(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -696,7 +782,7 @@ func TestRegression_RepeatedCancellationDuringShutdown(t *testing.T) {
 	}
 }
 
-// 9. Regression Test (Case E): Old session cleanup cannot overwrite newer session's state
+// 11. Regression Test (Case E): Old session cleanup cannot overwrite newer session's state
 func TestRegression_OldSessionCleanupCannotOverwriteNewSessionState(t *testing.T) {
 	srv, err := NewAppServer(&MockCommandRunner{})
 	if err != nil {
@@ -741,7 +827,6 @@ func TestRegression_OldSessionCleanupCannotOverwriteNewSessionState(t *testing.T
 		t.Fatalf("expected monotonic generation increase: sess1=%d, sess2=%d", sess1.Generation, sess2.Generation)
 	}
 
-	// Simulate late/out-of-order cleanup callbacks from the old session (sess1)
 	srv.onSessionExit(sess1, RecvIdle)
 	srv.onSessionExit(sess1, RecvError)
 	sess1.Cancel()
