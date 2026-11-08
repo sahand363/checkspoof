@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -241,12 +242,29 @@ type PreparedSessionInfo struct {
 	PacketCount      int    `json:"packet_count"`
 }
 
+// CrashJournalEntry records a process-owned SNAT chain on disk so a subsequent startup
+// can clean up chains orphaned by a hard crash (SIGKILL/power loss) of a dead PID
+// without ever touching chains belonging to live CheckSpoof processes.
+type CrashJournalEntry struct {
+	PID          int      `json:"pid"`
+	InstanceID   string   `json:"instance_id"`
+	SessionID    string   `json:"session_id"`
+	ChainName    string   `json:"chain_name"`
+	JumpArgs     []string `json:"jump_args"`
+	ChainCreated bool     `json:"chain_created"`
+	RuleAdded    bool     `json:"rule_added"`
+	JumpInserted bool     `json:"jump_inserted"`
+}
+
+var journalFileMu sync.Mutex
+
 // AppServer encapsulates the entire state of a CheckSpoof node.
 type AppServer struct {
 	prepMu sync.Mutex
 
 	mu                sync.RWMutex
 	ServerID          string
+	InstanceChainID   string
 	LocalOutboundIP   string
 	LocalInterface    string
 	PublicIP          string
@@ -275,7 +293,11 @@ type AppServer struct {
 	ActiveRecvSession *ReceiverSession
 	SessionHistory    map[string]*ReceiverSession
 	ActiveTestRunning bool
-	ActiveChains      map[string][]string
+
+	chainsMu    sync.Mutex
+	chainSeq    uint64
+	OwnedChains map[string]*SNATChainIsolation
+	JournalPath string
 
 	logsMu   sync.Mutex
 	LiveLogs []string
@@ -289,6 +311,7 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 		runner = &RealCommandRunner{}
 	}
 	srvID := randomHex(8)
+	instChainID := strings.ToUpper(srvID[:6])
 	pairSecret := randomHex(16)
 	adminKey := randomHex(12)
 
@@ -328,8 +351,14 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 		return nil, err
 	}
 
+	journalPath := ""
+	if !runner.IsMock() {
+		journalPath = "/tmp/checkspoof_snat_journal.json"
+	}
+
 	s := &AppServer{
 		ServerID:           srvID,
+		InstanceChainID:    instChainID,
 		LocalOutboundIP:    localIP,
 		LocalInterface:     localIface,
 		PublicIP:           pubIP,
@@ -348,7 +377,8 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 		LocalReceiverState: RecvIdle,
 		PeerReceiverState:  RecvIdle,
 		SessionHistory:     make(map[string]*ReceiverSession),
-		ActiveChains:       make(map[string][]string),
+		OwnedChains:        make(map[string]*SNATChainIsolation),
+		JournalPath:        journalPath,
 		stopCh:             make(chan struct{}),
 	}
 	return s, nil
@@ -367,11 +397,7 @@ func computeBehindNAT(localIP, publicIP string) bool {
 	return false
 }
 
-// EffectiveControlIP returns the best known control IPv4 address for pairing/listening:
-// 1. Verified or manually configured PublicIP if known.
-// 2. Explicitly configured ServerIP if valid IPv4.
-// 3. LocalOutboundIP if valid IPv4 (for private LAN / test environments).
-// 4. "UNKNOWN" if no valid IPv4 is available.
+// EffectiveControlIP returns the best known control IPv4 address for pairing/listening.
 func (s *AppServer) EffectiveControlIP() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -391,8 +417,7 @@ func (s *AppServer) effectiveControlIPLocked() string {
 	return IPValueUnknown
 }
 
-// SetManualPublicIP configures an explicit public IPv4 address (or clears it to UNKNOWN if empty/"UNKNOWN"),
-// regenerates the TLS certificate SANs so peer verification succeeds on the new IP, and updates NAT status.
+// SetManualPublicIP configures an explicit public IPv4 address.
 func (s *AppServer) SetManualPublicIP(ipStr string) error {
 	ipStr = strings.TrimSpace(ipStr)
 	if ipStr == "" || strings.EqualFold(ipStr, IPValueUnknown) {
@@ -439,8 +464,6 @@ func (s *AppServer) SetManualPublicIP(ipStr string) error {
 }
 
 // DiscoverAndSetPublicIP queries external public IP discovery endpoints.
-// If discovery fails, times out, returns a non-public IP, or returns conflicting results,
-// PublicIP is explicitly set to "UNKNOWN" instead of guessing.
 func (s *AppServer) DiscoverAndSetPublicIP(ctx context.Context) (string, error) {
 	s.mu.RLock()
 	if s.PublicIPSource == PublicIPManual && isValidIPv4(s.PublicIP) {
@@ -484,7 +507,6 @@ func (s *AppServer) DiscoverAndSetPublicIP(ctx context.Context) (string, error) 
 }
 
 // DiscoverPublicIP queries one or more HTTP endpoints for the server's public IPv4 address.
-// It rejects private/reserved addresses and reports an error if multiple endpoints return conflicting public IPs.
 func DiscoverPublicIP(ctx context.Context, client *http.Client, endpoints []string) (string, error) {
 	if len(endpoints) == 0 {
 		return IPValueUnknown, errors.New("no public IP discovery endpoints configured")
@@ -878,29 +900,80 @@ func ValidateICMPRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNon
 	return 0, 0, 0, errors.New("no valid CheckSpoof cryptographic signature found in ICMP payload")
 }
 
-// Isolated iptables SNAT Chain Management
+// Process/Session-Scoped Isolated iptables SNAT Chain Lifecycle Management
 
+// SNATChainIsolation tracks the exact firewall resources created by a single test session
+// so cleanup removes ONLY resources owned by that session and safely rolls back partial state.
 type SNATChainIsolation struct {
-	ChainName string
-	JumpArgs  []string
-	Runner    CommandRunner
-	Server    *AppServer
-	cleaned   bool
-	mu        sync.Mutex
+	ChainName    string
+	InstanceID   string
+	SessionID    string
+	JumpArgs     []string
+	RuleArgs     []string
+	Runner       CommandRunner
+	Server       *AppServer
+	chainCreated bool
+	ruleAdded    bool
+	jumpInserted bool
+	cleaned      bool
+	mu           sync.Mutex
 }
 
-func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, shortID, iface, targetIP, spoofIP, proto string, udpPort int) (*SNATChainIsolation, error) {
-	chainName := "CSPF_" + strings.ToUpper(shortID)
-	if len(chainName) > 20 {
-		chainName = chainName[:20]
+func sanitizeAlphaNumUpper(s string, maxLen int) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(strings.TrimSpace(s)) {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
+			if b.Len() >= maxLen {
+				break
+			}
+		}
 	}
+	return b.String()
+}
 
-	_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
-	_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
-
-	if out, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-N", chainName); err != nil {
-		return nil, fmt.Errorf("failed to create isolated iptables chain %s: %v (%s)", chainName, err, strings.TrimSpace(string(out)))
+// BuildSNATChainName generates a process- and session-scoped iptables chain name:
+// Format: CSPF_<6CharInstanceID>_<8CharSessionTag> (max 20 chars, well under Linux's 28-char limit).
+func (s *AppServer) BuildSNATChainName(sessionID string) string {
+	inst := sanitizeAlphaNumUpper(s.InstanceChainID, 6)
+	if len(inst) < 6 {
+		inst = sanitizeAlphaNumUpper(s.ServerID, 6)
 	}
+	if inst == "" {
+		inst = "NODE00"
+	}
+	sess := sanitizeAlphaNumUpper(sessionID, 8)
+	if sess == "" {
+		seq := atomic.AddUint64(&s.chainSeq, 1)
+		sess = fmt.Sprintf("S%07X", seq&0xFFFFFFF)
+	}
+	return fmt.Sprintf("CSPF_%s_%s", inst, sess)
+}
+
+func (s *AppServer) allocateUniqueChainName(sessionID string) string {
+	base := s.BuildSNATChainName(sessionID)
+	s.chainsMu.Lock()
+	defer s.chainsMu.Unlock()
+
+	if _, exists := s.OwnedChains[base]; !exists {
+		return base
+	}
+	// If the caller passed a duplicate sessionID while a chain with that ID is still active,
+	// disambiguate using the monotonic per-instance chain sequence so we never clobber an active session.
+	inst := sanitizeAlphaNumUpper(s.InstanceChainID, 6)
+	for {
+		seq := atomic.AddUint64(&s.chainSeq, 1)
+		candidate := fmt.Sprintf("CSPF_%s_%08X", inst, seq&0xFFFFFFFF)
+		if _, exists := s.OwnedChains[candidate]; !exists {
+			return candidate
+		}
+	}
+}
+
+// SetupIsolatedSNATChain creates a uniquely identifiable per-process/per-session NAT chain,
+// tracks each initialization step for safe partial-failure rollback, and records ownership.
+func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, sessionID, iface, targetIP, spoofIP, proto string, udpPort int) (*SNATChainIsolation, error) {
+	chainName := s.allocateUniqueChainName(sessionID)
 
 	var ruleArgs []string
 	var jumpSpec []string
@@ -913,37 +986,70 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, shortID, iface, 
 		jumpSpec = []string{"-o", iface, "-d", targetIP, "-p", "icmp", "-j", chainName}
 	}
 
+	iso := &SNATChainIsolation{
+		ChainName:  chainName,
+		InstanceID: s.InstanceChainID,
+		SessionID:  sessionID,
+		JumpArgs:   jumpSpec,
+		RuleArgs:   ruleArgs,
+		Runner:     s.Runner,
+		Server:     s,
+	}
+
+	// Register ownership in s.OwnedChains before executing iptables commands so concurrent
+	// Shutdown/CleanupAllChains calls are aware of in-progress or active chains.
+	s.chainsMu.Lock()
+	s.OwnedChains[chainName] = iso
+	s.chainsMu.Unlock()
+
+	// Step 1: Create dedicated chain (-N). Never pre-flush or pre-delete before -N,
+	// so we can never accidentally destroy an existing chain.
+	if out, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-N", chainName); err != nil {
+		s.chainsMu.Lock()
+		delete(s.OwnedChains, chainName)
+		s.chainsMu.Unlock()
+		return nil, fmt.Errorf("failed to create isolated iptables chain %s: %v (%s)", chainName, err, strings.TrimSpace(string(out)))
+	}
+
+	iso.mu.Lock()
+	iso.chainCreated = true
+	iso.mu.Unlock()
+	s.syncCrashJournal()
+
+	// Step 2: Insert SNAT rule inside our newly created chain (-A).
 	if out, _, err := s.Runner.Run(ctx, "iptables", ruleArgs...); err != nil {
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
+		iso.Cleanup()
 		return nil, fmt.Errorf("failed to insert SNAT rule into %s: %v (%s)", chainName, err, strings.TrimSpace(string(out)))
 	}
 
+	iso.mu.Lock()
+	iso.ruleAdded = true
+	iso.mu.Unlock()
+	s.syncCrashJournal()
+
+	// Step 3: Verify rule creation and target SNAT address inside our dedicated chain.
 	verifyOut, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-L", chainName, "-v", "-n", "-x")
 	if err != nil || !strings.Contains(string(verifyOut), "to:"+spoofIP) {
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
+		iso.Cleanup()
 		return nil, fmt.Errorf("failed to verify SNAT rule in chain %s", chainName)
 	}
 
+	// Step 4: Hook chain into POSTROUTING (-I POSTROUTING 1).
 	insertArgs := append([]string{"-t", "nat", "-I", "POSTROUTING", "1"}, jumpSpec...)
 	if out, _, err := s.Runner.Run(ctx, "iptables", insertArgs...); err != nil {
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
+		iso.Cleanup()
 		return nil, fmt.Errorf("failed to hook chain %s into POSTROUTING: %v (%s)", chainName, err, strings.TrimSpace(string(out)))
 	}
 
-	s.mu.Lock()
-	s.ActiveChains[chainName] = jumpSpec
-	s.mu.Unlock()
+	iso.mu.Lock()
+	iso.jumpInserted = true
+	iso.mu.Unlock()
+	s.syncCrashJournal()
 
-	return &SNATChainIsolation{
-		ChainName: chainName,
-		JumpArgs:  jumpSpec,
-		Runner:    s.Runner,
-		Server:    s,
-	}, nil
+	return iso, nil
 }
 
+// ReadCounters reads exact packet and byte counters exclusively from the session's isolated chain.
 func (c *SNATChainIsolation) ReadCounters(ctx context.Context) (packets int, bytesCount int, rawOutput string, err error) {
 	out, _, err := c.Runner.Run(ctx, "iptables", "-t", "nat", "-L", c.ChainName, "-v", "-n", "-x")
 	rawOutput = string(out)
@@ -975,76 +1081,170 @@ func ParseIsolatedChainCounters(output string) (int, int, error) {
 	return 0, 0, errors.New("SNAT rule counter line not found in isolated chain output")
 }
 
+// Cleanup safely, idempotently, and concurrency-safely removes ONLY the firewall resources
+// created by this specific SNATChainIsolation session.
 func (c *SNATChainIsolation) Cleanup() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.cleaned {
+		c.mu.Unlock()
 		return
 	}
 	c.cleaned = true
+	jumpInserted := c.jumpInserted
+	chainCreated := c.chainCreated
+	jumpArgs := append([]string(nil), c.JumpArgs...)
+	chainName := c.ChainName
+	c.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	delArgs := append([]string{"-t", "nat", "-D", "POSTROUTING"}, c.JumpArgs...)
-	_, _, _ = c.Runner.Run(ctx, "iptables", delArgs...)
-	_, _, _ = c.Runner.Run(ctx, "iptables", "-t", "nat", "-F", c.ChainName)
-	_, _, _ = c.Runner.Run(ctx, "iptables", "-t", "nat", "-X", c.ChainName)
+	// Remove POSTROUTING jump rule ONLY if it was actually inserted by this session.
+	if jumpInserted && len(jumpArgs) > 0 {
+		delArgs := append([]string{"-t", "nat", "-D", "POSTROUTING"}, jumpArgs...)
+		_, _, _ = c.Runner.Run(ctx, "iptables", delArgs...)
+	}
+
+	// Flush and delete the isolated chain ONLY if it was actually created by this session.
+	if chainCreated && chainName != "" {
+		_, _, _ = c.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
+		_, _, _ = c.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
+	}
 
 	if c.Server != nil {
-		c.Server.mu.Lock()
-		delete(c.Server.ActiveChains, c.ChainName)
-		c.Server.mu.Unlock()
+		c.Server.chainsMu.Lock()
+		delete(c.Server.OwnedChains, chainName)
+		c.Server.chainsMu.Unlock()
+		c.Server.syncCrashJournal()
 	}
 }
 
+// CleanupAllChains cleans up ONLY the SNAT chains and rules owned by this AppServer instance.
+// It never sweeps or deletes chains belonging to other CheckSpoof processes or unrelated firewall rules.
 func (s *AppServer) CleanupAllChains() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	s.mu.Lock()
-	chains := make(map[string][]string, len(s.ActiveChains))
-	for k, v := range s.ActiveChains {
-		chains[k] = v
+	s.chainsMu.Lock()
+	owned := make([]*SNATChainIsolation, 0, len(s.OwnedChains))
+	for _, iso := range s.OwnedChains {
+		owned = append(owned, iso)
 	}
-	s.ActiveChains = make(map[string][]string)
-	s.mu.Unlock()
+	s.chainsMu.Unlock()
 
-	for chainName, jumpSpec := range chains {
-		delArgs := append([]string{"-t", "nat", "-D", "POSTROUTING"}, jumpSpec...)
-		_, _, _ = s.Runner.Run(ctx, "iptables", delArgs...)
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
+	for _, iso := range owned {
+		iso.Cleanup()
 	}
+}
 
-	out, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-S")
-	if err != nil {
+// Crash Recovery Journal Helpers
+
+func isProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if pid == os.Getpid() {
+		return true
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func (s *AppServer) syncCrashJournal() {
+	if s.JournalPath == "" {
 		return
 	}
-	var staleChains []string
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "-A POSTROUTING ") && strings.Contains(line, " -j CSPF_") {
-			delLine := strings.Replace(line, "-A POSTROUTING ", "-D POSTROUTING ", 1)
-			args := append([]string{"-t", "nat"}, strings.Fields(delLine)...)
-			_, _, _ = s.Runner.Run(ctx, "iptables", args...)
-		} else if strings.HasPrefix(line, "-N CSPF_") {
-			parts := strings.Fields(line)
-			if len(parts) == 2 {
-				staleChains = append(staleChains, parts[1])
-			}
+
+	s.chainsMu.Lock()
+	myEntries := make([]CrashJournalEntry, 0, len(s.OwnedChains))
+	for _, iso := range s.OwnedChains {
+		iso.mu.Lock()
+		if !iso.cleaned && iso.chainCreated {
+			myEntries = append(myEntries, CrashJournalEntry{
+				PID:          os.Getpid(),
+				InstanceID:   s.InstanceChainID,
+				SessionID:    iso.SessionID,
+				ChainName:    iso.ChainName,
+				JumpArgs:     append([]string(nil), iso.JumpArgs...),
+				ChainCreated: iso.chainCreated,
+				RuleAdded:    iso.ruleAdded,
+				JumpInserted: iso.jumpInserted,
+			})
+		}
+		iso.mu.Unlock()
+	}
+	s.chainsMu.Unlock()
+
+	journalFileMu.Lock()
+	defer journalFileMu.Unlock()
+
+	var existing []CrashJournalEntry
+	if data, err := os.ReadFile(s.JournalPath); err == nil && len(data) > 0 {
+		_ = json.Unmarshal(data, &existing)
+	}
+
+	// Preserve entries from other AppServer instances; replace only this instance's entries.
+	merged := make([]CrashJournalEntry, 0, len(existing)+len(myEntries))
+	for _, e := range existing {
+		if e.InstanceID != s.InstanceChainID {
+			merged = append(merged, e)
 		}
 	}
-	for _, ch := range staleChains {
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", ch)
-		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", ch)
+	merged = append(merged, myEntries...)
+
+	if len(merged) == 0 {
+		_ = os.Remove(s.JournalPath)
+		return
 	}
+	if encoded, err := json.MarshalIndent(merged, "", "  "); err == nil {
+		_ = os.WriteFile(s.JournalPath, encoded, 0600)
+	}
+}
+
+// RecoverOrphanedChainsFromJournal inspects the crash journal and cleans up ONLY chains
+// whose owning process PID is no longer alive. Chains belonging to live processes are untouched.
+func (s *AppServer) RecoverOrphanedChainsFromJournal(ctx context.Context) int {
+	if s.JournalPath == "" {
+		return 0
+	}
+
+	journalFileMu.Lock()
+	defer journalFileMu.Unlock()
+
+	data, err := os.ReadFile(s.JournalPath)
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+	var entries []CrashJournalEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return 0
+	}
+
+	var surviving []CrashJournalEntry
+	recovered := 0
+	for _, e := range entries {
+		if isProcessAlive(e.PID) {
+			surviving = append(surviving, e)
+			continue
+		}
+		if e.JumpInserted && len(e.JumpArgs) > 0 {
+			delArgs := append([]string{"-t", "nat", "-D", "POSTROUTING"}, e.JumpArgs...)
+			_, _, _ = s.Runner.Run(ctx, "iptables", delArgs...)
+		}
+		if e.ChainCreated && e.ChainName != "" {
+			_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", e.ChainName)
+			_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", e.ChainName)
+		}
+		recovered++
+	}
+
+	if len(surviving) == 0 {
+		_ = os.Remove(s.JournalPath)
+	} else if encoded, err := json.MarshalIndent(surviving, "", "  "); err == nil {
+		_ = os.WriteFile(s.JournalPath, encoded, 0600)
+	}
+	return recovered
 }
 
 // Routing & Outbound Interface / Source IP Discovery via `ip route get`
 
-// ParseIPRouteGetOutput parses the output of `ip route get <destination>` to extract
-// the outgoing interface (`dev`), local source IP (`src`), and gateway (`via`).
 func ParseIPRouteGetOutput(output string) (RouteInfo, error) {
 	fields := strings.Fields(strings.TrimSpace(output))
 	if len(fields) == 0 {
@@ -1090,8 +1290,6 @@ func ParseIPRouteGetOutput(output string) (RouteInfo, error) {
 	return info, nil
 }
 
-// DetectLocalOutboundRoute executes `ip route get <targetIP>` to determine the outgoing interface
-// and local source IPv4 address for a specific destination.
 func DetectLocalOutboundRoute(ctx context.Context, runner CommandRunner, targetIP string) (RouteInfo, error) {
 	if !isValidIPv4(targetIP) {
 		return RouteInfo{}, fmt.Errorf("invalid target IPv4 address: %s", targetIP)
@@ -1106,8 +1304,6 @@ func DetectLocalOutboundRoute(ctx context.Context, runner CommandRunner, targetI
 	return ParseIPRouteGetOutput(string(out))
 }
 
-// ResolveRoute resolves the kernel route (interface, source IP, gateway) for targetIP
-// and updates the server's cached local outbound interface/IP if not yet populated.
 func (s *AppServer) ResolveRoute(ctx context.Context, targetIP string) (RouteInfo, error) {
 	info, err := DetectLocalOutboundRoute(ctx, s.Runner, targetIP)
 	if err != nil {
@@ -1774,7 +1970,6 @@ func (s *AppServer) handlePeerPair(w http.ResponseWriter, r *http.Request) {
 
 	observedIP := extractRemoteHostIP(r.RemoteAddr)
 
-	// Determine the peer's verified public IP without assuming its local interface IP is public.
 	peerPublicIP := IPValueUnknown
 	if IsPublicRoutableIPv4(req.SenderPublicIP) {
 		peerPublicIP = req.SenderPublicIP
@@ -1782,7 +1977,6 @@ func (s *AppServer) handlePeerPair(w http.ResponseWriter, r *http.Request) {
 		peerPublicIP = observedIP
 	}
 
-	// Determine the routable control IP and port for reverse communication to the peer.
 	peerPort := strings.TrimSpace(req.SenderListenPort)
 	if peerPort == "" {
 		if _, p, err := net.SplitHostPort(req.SenderAddr); err == nil {
@@ -2020,7 +2214,6 @@ func (s *AppServer) handleAdminPair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve route to peer's control IP via `ip route get` so we know the exact outgoing interface and local source IP.
 	routeCtx, routeCancel := context.WithTimeout(r.Context(), 2*time.Second)
 	routeInfo, routeErr := s.ResolveRoute(routeCtx, peerCfg.ControlIP)
 	routeCancel()
@@ -2251,10 +2444,6 @@ func (s *AppServer) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(result)
 }
 
-// isGenuineNetworkSpoofSetup returns true only if:
-// 1. The command runner is executing real OS commands (not a mock runner).
-// 2. TargetIP and SpoofIP are non-loopback IPv4 addresses.
-// 3. SpoofIP is distinct from the sender's local outbound IP, route source IP, public IP, and ServerIP.
 func (s *AppServer) isGenuineNetworkSpoofSetup(targetIP, spoofIP string, routeSrcIP ...string) (bool, string) {
 	if s.Runner == nil || s.Runner.IsMock() {
 		return false, "mocked CommandRunner is in use (iptables SNAT not applied to real kernel netfilter)"
@@ -2331,7 +2520,7 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	res.OutgoingInterface = iface
 	res.OutgoingSourceIP = routeInfo.SourceIP
 
-	// Stage 2: Isolated iptables SNAT Chain Installation
+	// Stage 2: Isolated Per-Process/Per-Session iptables SNAT Chain Installation
 	shortID := prep.SessionID[:8]
 	chainIso, err := s.SetupIsolatedSNATChain(ctx, shortID, iface, targetIP, prep.ExpectedSourceIP, prep.TestType, prep.UDPPort)
 	if err != nil {
@@ -2541,7 +2730,6 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 	senderCertFP := s.CertFingerprint
 	s.mu.RUnlock()
 
-	// Phase 1: Mutual TLS Pairing
 	pairReq := PeerPairRequest{
 		SenderServerID:        s.ServerID,
 		SenderAddr:            fmt.Sprintf("%s:%s", senderCtrlIP, senderPort),
@@ -2566,7 +2754,6 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 	s.LastHeartbeat = time.Now()
 	s.mu.Unlock()
 
-	// Phase 2: Explicit Receiver Listener Preparation
 	sessionID := randomHex(16)
 	nonce := randomHex(16)
 	prepReq := PeerPrepareRequest{
@@ -2595,7 +2782,6 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 		PacketCount:      packetCount,
 	}
 
-	// Phase 3: Execute Coordinated Spoof Test & Verify Remote Reception
 	result := s.executeCoordinatedTest(ctx, peerCfg, prepInfo)
 	return result, nil
 }
@@ -3304,8 +3490,6 @@ func isValidIPv4(ipStr string) bool {
 	return ip != nil && ip.To4() != nil
 }
 
-// IsPrivateOrReservedLocalIPv4 returns true if ipStr is RFC1918 private (10/8, 172.16/12, 192.168/16),
-// CGNAT (100.64/10), loopback (127/8), link-local (169.254/16), multicast, or unspecified (0.0.0.0).
 func IsPrivateOrReservedLocalIPv4(ipStr string) bool {
 	ip := net.ParseIP(strings.TrimSpace(ipStr))
 	if ip == nil {
@@ -3318,19 +3502,15 @@ func IsPrivateOrReservedLocalIPv4(ipStr string) bool {
 	if ip4.IsLoopback() || ip4.IsPrivate() || ip4.IsLinkLocalUnicast() || ip4.IsLinkLocalMulticast() || ip4.IsMulticast() || ip4.IsUnspecified() {
 		return true
 	}
-	// RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
 	if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 		return true
 	}
-	// Broadcast 255.255.255.255
 	if ip4.Equal(net.IPv4bcast) {
 		return true
 	}
 	return false
 }
 
-// IsPublicRoutableIPv4 returns true only if ipStr is a valid IPv4 address that is not private,
-// loopback, CGNAT, link-local, multicast, or unspecified.
 func IsPublicRoutableIPv4(ipStr string) bool {
 	return isValidIPv4(ipStr) && !IsPrivateOrReservedLocalIPv4(ipStr)
 }
@@ -3418,7 +3598,11 @@ func main() {
 		fmt.Printf("[-] Initialization error: %v\n", err)
 		os.Exit(1)
 	}
-	srv.CleanupAllChains()
+
+	// Recover only chains orphaned by dead crashed PIDs; never touch active processes' chains.
+	recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = srv.RecoverOrphanedChainsFromJournal(recCtx)
+	recCancel()
 
 	if strings.TrimSpace(*publicIPFlag) != "" {
 		if err := srv.SetManualPublicIP(*publicIPFlag); err != nil {
@@ -3473,7 +3657,7 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		fmt.Println("\n[+] Shutting down CheckSpoof and cleaning up temporary firewall chains...")
+		fmt.Println("\n[+] Shutting down CheckSpoof and cleaning up owned firewall chains...")
 		srv.Shutdown()
 		_ = listener.Close()
 		os.Exit(0)
@@ -3486,7 +3670,7 @@ func main() {
 	ctrlIP := srv.EffectiveControlIP()
 	fmt.Println("======================================================================")
 	fmt.Printf("🛡️  CheckSpoof Enterprise v2 is running!\n")
-	fmt.Printf("🆔 Server ID         : %s\n", srv.ServerID)
+	fmt.Printf("🆔 Server ID         : %s (Chain Prefix: CSPF_%s_*)\n", srv.ServerID, srv.InstanceChainID)
 	fmt.Printf("📍 Local Outbound IP : %s (Interface: %s)\n", srv.LocalOutboundIP, srv.LocalInterface)
 	fmt.Printf("🌐 Public IP         : %s (Source: %s, Behind NAT: %v)\n", srv.PublicIP, srv.PublicIPSource, srv.BehindNAT)
 	fmt.Printf("🌐 Dashboard Login   : https://%s:%s/?key=%s\n", ctrlIP, srv.Port, srv.AdminKey)
