@@ -88,6 +88,23 @@ func (r *RealCommandRunner) Run(ctx context.Context, name string, args ...string
 	return out, exitCode, err
 }
 
+// PacketListenerBinder abstracts UDP and Raw ICMP listener binding so startup cancellation
+// and concurrent preparation can be deterministically tested without arbitrary sleeps.
+type PacketListenerBinder interface {
+	ListenUDP(ctx context.Context, network string, laddr *net.UDPAddr) (net.PacketConn, error)
+	ListenICMP(ctx context.Context, network, address string) (net.PacketConn, error)
+}
+
+type RealListenerBinder struct{}
+
+func (b *RealListenerBinder) ListenUDP(_ context.Context, network string, laddr *net.UDPAddr) (net.PacketConn, error) {
+	return net.ListenUDP(network, laddr)
+}
+
+func (b *RealListenerBinder) ListenICMP(_ context.Context, network, address string) (net.PacketConn, error) {
+	return net.ListenPacket(network, address)
+}
+
 // VerifiedPacketRecord stores metadata for each cryptographically verified packet.
 type VerifiedPacketRecord struct {
 	Seq          int    `json:"seq"`
@@ -107,18 +124,59 @@ type ReceiverSession struct {
 	TestType         string
 	UDPPort          int
 	MaxPackets       int
+	Generation       uint64
 	StartedAt        time.Time
 	ExpiresAt        time.Time
-	CancelFunc       context.CancelFunc
-	DoneChan         chan struct{}
+
+	ctx        context.Context
+	CancelFunc context.CancelFunc
+	DoneChan   chan struct{}
+
+	cancelOnce sync.Once
+	doneOnce   sync.Once
 
 	mu              sync.Mutex
+	cancelled       bool
 	State           string
 	LastError       string
 	SeenSeq         map[int]bool
 	VerifiedPackets []VerifiedPacketRecord
 	InvalidPackets  int
 	DuplicateCount  int
+}
+
+// Cancel safely and idempotently cancels the receiver session.
+func (rs *ReceiverSession) Cancel() {
+	rs.mu.Lock()
+	rs.cancelled = true
+	rs.mu.Unlock()
+
+	rs.cancelOnce.Do(func() {
+		if rs.CancelFunc != nil {
+			rs.CancelFunc()
+		}
+	})
+}
+
+// IsCancelled returns true if Cancel() has been invoked on this session.
+func (rs *ReceiverSession) IsCancelled() bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.cancelled
+}
+
+// GetState returns the current session state safely.
+func (rs *ReceiverSession) GetState() string {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.State
+}
+
+// markDone closes DoneChan exactly once.
+func (rs *ReceiverSession) markDone() {
+	rs.doneOnce.Do(func() {
+		close(rs.DoneChan)
+	})
 }
 
 // PeerConfig holds authenticated peer details for persistent TLS connection monitoring.
@@ -142,6 +200,10 @@ type PreparedSessionInfo struct {
 
 // AppServer encapsulates the entire state of a CheckSpoof node.
 type AppServer struct {
+	// prepMu serializes receiver session preparation transitions so concurrent callers
+	// cleanly replace the prior session one at a time without holding s.mu while waiting.
+	prepMu sync.Mutex
+
 	mu              sync.RWMutex
 	ServerID        string
 	ServerIP        string
@@ -151,6 +213,7 @@ type AppServer struct {
 	CertFingerprint string
 	TLSCert         tls.Certificate
 	Runner          CommandRunner
+	Binder          PacketListenerBinder
 
 	ConnState          string
 	LocalReceiverState string
@@ -160,14 +223,17 @@ type AppServer struct {
 	Peer               *PeerConfig
 	PreparedSession    *PreparedSessionInfo
 
+	recvGen           uint64
 	ActiveRecvSession *ReceiverSession
+	SessionHistory    map[string]*ReceiverSession
 	ActiveTestRunning bool
 	ActiveChains      map[string][]string
 
 	logsMu   sync.Mutex
 	LiveLogs []string
 
-	stopCh chan struct{}
+	stopOnce sync.Once
+	stopCh   chan struct{}
 }
 
 func NewAppServer(runner CommandRunner) (*AppServer, error) {
@@ -192,9 +258,11 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 		CertFingerprint:    fp,
 		TLSCert:            cert,
 		Runner:             runner,
+		Binder:             &RealListenerBinder{},
 		ConnState:          ConnDisconnected,
 		LocalReceiverState: RecvIdle,
 		PeerReceiverState:  RecvIdle,
+		SessionHistory:     make(map[string]*ReceiverSession),
 		ActiveChains:       make(map[string][]string),
 		stopCh:             make(chan struct{}),
 	}
@@ -454,7 +522,6 @@ func ValidateICMPRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNon
 	if len(rawPkt) < 24 {
 		return 0, 0, 0, errors.New("ICMP packet too short")
 	}
-	// Handle optional IPv4 header if kernel includes it
 	offset := 0
 	if (rawPkt[0] >> 4) == 4 {
 		ihl := int(rawPkt[0]&0x0f) * 4
@@ -482,7 +549,6 @@ func ValidateICMPRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNon
 		return 0, 0, 0, errors.New("invalid expected nonce")
 	}
 
-	// Scan payload for our 16-byte signed binary frame
 	for i := 0; i <= len(payload)-16; i++ {
 		chunk := payload[i : i+16]
 		if chunk[0] != 0xC5 {
@@ -519,24 +585,19 @@ type SNATChainIsolation struct {
 	mu        sync.Mutex
 }
 
-// SetupIsolatedSNATChain creates a dedicated chain `CSPF_<shortID>` in the `nat` table,
-// adds the SNAT rule inside it, verifies rule creation, and inserts a jump rule in POSTROUTING.
 func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, shortID, iface, targetIP, spoofIP, proto string, udpPort int) (*SNATChainIsolation, error) {
 	chainName := "CSPF_" + strings.ToUpper(shortID)
 	if len(chainName) > 20 {
 		chainName = chainName[:20]
 	}
 
-	// Clean up if chain already exists
 	_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
 	_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
 
-	// 1. Create dedicated chain
 	if out, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-N", chainName); err != nil {
 		return nil, fmt.Errorf("failed to create isolated iptables chain %s: %v (%s)", chainName, err, strings.TrimSpace(string(out)))
 	}
 
-	// 2. Add SNAT rule inside dedicated chain
 	var ruleArgs []string
 	var jumpSpec []string
 	if proto == "udp" {
@@ -553,7 +614,6 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, shortID, iface, 
 		return nil, fmt.Errorf("failed to insert SNAT rule into %s: %v (%s)", chainName, err, strings.TrimSpace(string(out)))
 	}
 
-	// 3. Verify rule creation in dedicated chain
 	verifyOut, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-L", chainName, "-v", "-n", "-x")
 	if err != nil || !strings.Contains(string(verifyOut), "to:"+spoofIP) {
 		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
@@ -561,7 +621,6 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, shortID, iface, 
 		return nil, fmt.Errorf("failed to verify SNAT rule in chain %s", chainName)
 	}
 
-	// 4. Insert jump rule at top of POSTROUTING
 	insertArgs := append([]string{"-t", "nat", "-I", "POSTROUTING", "1"}, jumpSpec...)
 	if out, _, err := s.Runner.Run(ctx, "iptables", insertArgs...); err != nil {
 		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
@@ -581,7 +640,6 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, shortID, iface, 
 	}, nil
 }
 
-// ReadCounters reads exact packet and byte counters exclusively from the isolated test chain.
 func (c *SNATChainIsolation) ReadCounters(ctx context.Context) (packets int, bytesCount int, rawOutput string, err error) {
 	out, _, err := c.Runner.Run(ctx, "iptables", "-t", "nat", "-L", c.ChainName, "-v", "-n", "-x")
 	rawOutput = string(out)
@@ -592,7 +650,6 @@ func (c *SNATChainIsolation) ReadCounters(ctx context.Context) (packets int, byt
 	return packets, bytesCount, rawOutput, err
 }
 
-// ParseIsolatedChainCounters parses `iptables -t nat -L <CHAIN> -v -n -x` output.
 func ParseIsolatedChainCounters(output string) (int, int, error) {
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	for _, line := range lines {
@@ -614,7 +671,6 @@ func ParseIsolatedChainCounters(output string) (int, int, error) {
 	return 0, 0, errors.New("SNAT rule counter line not found in isolated chain output")
 }
 
-// Cleanup removes only the jump rule and isolated chain created for this test.
 func (c *SNATChainIsolation) Cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -638,7 +694,6 @@ func (c *SNATChainIsolation) Cleanup() {
 	}
 }
 
-// CleanupAllChains cleans up all active or stale CSPF_ chains on startup or shutdown.
 func (s *AppServer) CleanupAllChains() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -658,7 +713,6 @@ func (s *AppServer) CleanupAllChains() {
 		_, _, _ = s.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
 	}
 
-	// Also sweep any leftover CSPF_ rules from previous interrupted runs
 	out, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-S")
 	if err != nil {
 		return
@@ -685,7 +739,6 @@ func (s *AppServer) CleanupAllChains() {
 
 // Routing & Interface Discovery
 
-// ResolveOutgoingInterface uses `ip route get TARGET_IP` and validates route availability.
 func (s *AppServer) ResolveOutgoingInterface(ctx context.Context, targetIP string) (string, error) {
 	if !isValidIPv4(targetIP) {
 		return "", errors.New("invalid target IPv4 address")
@@ -703,7 +756,7 @@ func (s *AppServer) ResolveOutgoingInterface(ctx context.Context, targetIP strin
 	return "", fmt.Errorf("no outgoing interface found in route output: %s", strings.TrimSpace(string(out)))
 }
 
-// Receiver Readiness & Background Packet Listener Lifecycle
+// Receiver Readiness & Deadlock-Free Background Packet Listener Lifecycle
 
 type PeerPrepareRequest struct {
 	SessionID        string `json:"session_id"`
@@ -722,29 +775,24 @@ type PeerPrepareResponse struct {
 	Message       string `json:"message"`
 }
 
-// StartReceiverSession binds the requested socket synchronously, verifies readiness,
-// and keeps the listener running in a managed background goroutine until stopped or timed out.
+// StartReceiverSession prepares a new receiver session using context.Background().
 func (s *AppServer) StartReceiverSession(req PeerPrepareRequest, sharedSecret string) (*PeerPrepareResponse, error) {
-	s.mu.Lock()
-	if s.ActiveRecvSession != nil {
-		s.ActiveRecvSession.mu.Lock()
-		st := s.ActiveRecvSession.State
-		s.ActiveRecvSession.mu.Unlock()
-		if st == RecvReady || st == RecvRunning || st == RecvInitializing {
-			// Cancel previous session if it belonged to the same peer re-preparing
-			s.ActiveRecvSession.CancelFunc()
-			<-s.ActiveRecvSession.DoneChan
-		}
-	}
-	s.LocalReceiverState = RecvInitializing
-	s.mu.Unlock()
+	return s.StartReceiverSessionWithContext(context.Background(), req, sharedSecret)
+}
 
+// StartReceiverSessionWithContext safely detaches, cancels, and awaits any prior receiver session
+// without holding s.mu, serializes concurrent preparation requests via s.prepMu, fences state
+// updates via s.recvGen, and cleans up partial resources if cancelled during startup.
+func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, req PeerPrepareRequest, sharedSecret string) (*PeerPrepareResponse, error) {
+	if callerCtx == nil {
+		callerCtx = context.Background()
+	}
+
+	// Validate request parameters before acquiring lifecycle locks
 	if !isValidIPv4(req.ExpectedSourceIP) {
-		s.setLocalRecvState(RecvError)
 		return nil, errors.New("invalid expected_source_ip")
 	}
 	if req.TestType != "icmp" && req.TestType != "udp" {
-		s.setLocalRecvState(RecvError)
 		return nil, errors.New("unsupported test_type (must be icmp or udp)")
 	}
 	if req.UDPPort <= 0 || req.UDPPort > 65535 {
@@ -756,8 +804,25 @@ func (s *AppServer) StartReceiverSession(req PeerPrepareRequest, sharedSecret st
 	if req.TimeoutSec <= 0 || req.TimeoutSec > 60 {
 		req.TimeoutSec = 30
 	}
+	if req.SessionID == "" {
+		req.SessionID = randomHex(16)
+	}
+	if req.Nonce == "" {
+		req.Nonce = randomHex(16)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.TimeoutSec)*time.Second)
+	// Serialize session preparation transitions so two concurrent callers cannot race
+	// to bind the same port simultaneously.
+	s.prepMu.Lock()
+	defer s.prepMu.Unlock()
+
+	// 1. Detach any previous session and register the new initializing session under s.mu.
+	s.mu.Lock()
+	oldSess := s.ActiveRecvSession
+	s.recvGen++
+	myGen := s.recvGen
+
+	sessCtx, sessCancel := context.WithTimeout(context.Background(), time.Duration(req.TimeoutSec)*time.Second)
 	sess := &ReceiverSession{
 		SessionID:        req.SessionID,
 		Nonce:            req.Nonce,
@@ -765,41 +830,97 @@ func (s *AppServer) StartReceiverSession(req PeerPrepareRequest, sharedSecret st
 		TestType:         req.TestType,
 		UDPPort:          req.UDPPort,
 		MaxPackets:       req.MaxPackets,
+		Generation:       myGen,
 		StartedAt:        time.Now(),
 		ExpiresAt:        time.Now().Add(time.Duration(req.TimeoutSec) * time.Second),
-		CancelFunc:       cancel,
+		ctx:              sessCtx,
+		CancelFunc:       sessCancel,
 		DoneChan:         make(chan struct{}),
 		State:            RecvInitializing,
 		SeenSeq:          make(map[int]bool),
 		VerifiedPackets:  []VerifiedPacketRecord{},
 	}
 
-	// Bind the listener synchronously BEFORE returning READY_TO_RECEIVE
+	if callerCtx.Err() != nil {
+		sess.cancelled = true
+	}
+
+	s.ActiveRecvSession = sess
+	if len(s.SessionHistory) >= 32 {
+		s.SessionHistory = make(map[string]*ReceiverSession)
+	}
+	s.SessionHistory[sess.SessionID] = sess
+	s.LocalReceiverState = RecvInitializing
+	s.mu.Unlock()
+
+	// Propagate callerCtx cancellation or server stop to sess.Cancel()
+	watchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-callerCtx.Done():
+			sess.Cancel()
+		case <-s.stopCh:
+			sess.Cancel()
+		case <-sess.DoneChan:
+		case <-watchDone:
+		}
+	}()
+	defer close(watchDone)
+
+	// 2. If a prior session existed, cancel it and wait for its full cleanup WITHOUT holding s.mu!
+	if oldSess != nil {
+		oldSess.Cancel()
+		<-oldSess.DoneChan
+	}
+
+	// 3. Check if this new session was cancelled while waiting for the old session to stop.
+	if sess.IsCancelled() || sessCtx.Err() != nil || callerCtx.Err() != nil {
+		s.abortStartupSession(sess, RecvIdle, "session cancelled before listener initialization")
+		return nil, errors.New("receiver session cancelled before listener initialization")
+	}
+
+	binder := s.Binder
+	if binder == nil {
+		binder = &RealListenerBinder{}
+	}
+
+	// 4. Bind the requested socket (without holding s.mu).
 	if req.TestType == "udp" {
 		bindAddr := fmt.Sprintf("0.0.0.0:%d", req.UDPPort)
 		udpAddr, err := net.ResolveUDPAddr("udp4", bindAddr)
 		if err != nil {
-			cancel()
-			s.setLocalRecvState(RecvError)
+			s.abortStartupSession(sess, RecvError, err.Error())
 			return nil, err
 		}
-		conn, err := net.ListenUDP("udp4", udpAddr)
+		conn, err := binder.ListenUDP(sessCtx, "udp4", udpAddr)
 		if err != nil {
-			cancel()
-			s.setLocalRecvState(RecvError)
+			s.abortStartupSession(sess, RecvError, err.Error())
 			s.AddLog(fmt.Sprintf("[-] [Receiver] Failed to bind UDP listener on %s: %v", bindAddr, err))
 			return nil, fmt.Errorf("UDP socket bind failed on %s: %v", bindAddr, err)
 		}
-		actualAddr := conn.LocalAddr().String()
-		sess.State = RecvReady
 
+		// Atomically verify the session was not cancelled while ListenUDP was running.
+		sess.mu.Lock()
+		if sess.cancelled || sessCtx.Err() != nil || callerCtx.Err() != nil {
+			sess.State = RecvError
+			sess.LastError = "cancelled during UDP listener startup"
+			sess.mu.Unlock()
+			_ = conn.Close()
+			s.abortStartupSession(sess, RecvIdle, "cancelled during UDP listener startup")
+			return nil, errors.New("receiver session cancelled during UDP listener initialization")
+		}
+		sess.State = RecvReady
+		sess.mu.Unlock()
+
+		actualAddr := conn.LocalAddr().String()
 		s.mu.Lock()
-		s.ActiveRecvSession = sess
-		s.LocalReceiverState = RecvReady
+		if s.recvGen == sess.Generation {
+			s.LocalReceiverState = RecvReady
+		}
 		s.mu.Unlock()
 
 		s.AddLog(fmt.Sprintf("🟢 [Receiver] READY_TO_RECEIVE on UDP %s (Session=%s, ExpectSource=%s)", actualAddr, req.SessionID[:8], req.ExpectedSourceIP))
-		go s.runUDPReceiverLoop(ctx, conn, sess, sharedSecret)
+		go s.runUDPReceiverLoop(sessCtx, conn, sess, sharedSecret)
 
 		return &PeerPrepareResponse{
 			SessionID:     req.SessionID,
@@ -809,23 +930,34 @@ func (s *AppServer) StartReceiverSession(req PeerPrepareRequest, sharedSecret st
 		}, nil
 	}
 
-	// ICMP Raw Listener
-	conn, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+	// Raw ICMP Listener
+	conn, err := binder.ListenICMP(sessCtx, "ip4:icmp", "0.0.0.0")
 	if err != nil {
-		cancel()
-		s.setLocalRecvState(RecvError)
+		s.abortStartupSession(sess, RecvError, err.Error())
 		s.AddLog(fmt.Sprintf("[-] [Receiver] Failed to bind ip4:icmp socket (CAP_NET_RAW required): %v", err))
 		return nil, fmt.Errorf("raw ICMP socket bind failed (requires root/CAP_NET_RAW): %v", err)
 	}
+
+	sess.mu.Lock()
+	if sess.cancelled || sessCtx.Err() != nil || callerCtx.Err() != nil {
+		sess.State = RecvError
+		sess.LastError = "cancelled during ICMP listener startup"
+		sess.mu.Unlock()
+		_ = conn.Close()
+		s.abortStartupSession(sess, RecvIdle, "cancelled during ICMP listener startup")
+		return nil, errors.New("receiver session cancelled during ICMP listener initialization")
+	}
 	sess.State = RecvReady
+	sess.mu.Unlock()
 
 	s.mu.Lock()
-	s.ActiveRecvSession = sess
-	s.LocalReceiverState = RecvReady
+	if s.recvGen == sess.Generation {
+		s.LocalReceiverState = RecvReady
+	}
 	s.mu.Unlock()
 
 	s.AddLog(fmt.Sprintf("🟢 [Receiver] READY_TO_RECEIVE on ip4:icmp (Session=%s, ExpectSource=%s)", req.SessionID[:8], req.ExpectedSourceIP))
-	go s.runICMPReceiverLoop(ctx, conn, sess, sharedSecret)
+	go s.runICMPReceiverLoop(sessCtx, conn, sess, sharedSecret)
 
 	return &PeerPrepareResponse{
 		SessionID:     req.SessionID,
@@ -835,29 +967,107 @@ func (s *AppServer) StartReceiverSession(req PeerPrepareRequest, sharedSecret st
 	}, nil
 }
 
-func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn *net.UDPConn, sess *ReceiverSession, secret string) {
+// abortStartupSession cleans up a session that failed or was cancelled during startup.
+func (s *AppServer) abortStartupSession(sess *ReceiverSession, serverState string, errMsg string) {
+	sess.Cancel()
+
+	sess.mu.Lock()
+	sess.State = RecvError
+	sess.LastError = errMsg
+	sess.mu.Unlock()
+
+	s.mu.Lock()
+	if s.recvGen == sess.Generation && s.ActiveRecvSession == sess {
+		s.LocalReceiverState = serverState
+		if serverState == RecvIdle {
+			s.ActiveRecvSession = nil
+		}
+	}
+	s.mu.Unlock()
+
+	sess.markDone()
+}
+
+// onSessionExit updates AppServer's LocalReceiverState only if sess is still the current generation.
+func (s *AppServer) onSessionExit(sess *ReceiverSession, finalServerState string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recvGen == sess.Generation && s.ActiveRecvSession == sess {
+		s.LocalReceiverState = finalServerState
+	}
+}
+
+// StopActiveReceiverSession cancels the active receiver session (if any) and waits for cleanup.
+func (s *AppServer) StopActiveReceiverSession() {
+	s.mu.RLock()
+	sess := s.ActiveRecvSession
+	s.mu.RUnlock()
+	if sess != nil {
+		sess.Cancel()
+		<-sess.DoneChan
+	}
+}
+
+// CancelReceiverSession cancels a specific session ID (or the active session if sessionID == "")
+// and waits for its cleanup to finish.
+func (s *AppServer) CancelReceiverSession(sessionID string) bool {
+	s.mu.RLock()
+	var sess *ReceiverSession
+	if sessionID != "" {
+		sess = s.SessionHistory[sessionID]
+	}
+	if sess == nil && s.ActiveRecvSession != nil && (sessionID == "" || s.ActiveRecvSession.SessionID == sessionID) {
+		sess = s.ActiveRecvSession
+	}
+	s.mu.RUnlock()
+
+	if sess == nil {
+		return false
+	}
+	sess.Cancel()
+	<-sess.DoneChan
+	return true
+}
+
+func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn net.PacketConn, sess *ReceiverSession, secret string) {
+	var closeOnce sync.Once
+	closeConn := func() {
+		closeOnce.Do(func() {
+			_ = conn.Close()
+		})
+	}
+
 	defer func() {
-		_ = conn.Close()
+		closeConn()
+		sess.Cancel()
+
+		finalServerState := RecvIdle
 		sess.mu.Lock()
-		if sess.State == RecvReady || sess.State == RecvRunning {
+		if sess.State == RecvReady || sess.State == RecvRunning || sess.State == RecvInitializing {
 			sess.State = RecvCompleted
+		} else if sess.State == RecvError {
+			finalServerState = RecvError
 		}
 		sess.mu.Unlock()
-		s.setLocalRecvState(RecvIdle)
-		close(sess.DoneChan)
+
+		s.onSessionExit(sess, finalServerState)
+		sess.markDone()
 		s.AddLog(fmt.Sprintf("🏁 [Receiver] UDP session %s closed.", sess.SessionID[:8]))
 	}()
 
 	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			closeConn()
+		case <-sess.DoneChan:
+		}
 	}()
 
 	buf := make([]byte, 2048)
 	for {
-		n, remoteAddr, err := conn.ReadFromUDP(buf)
+		n, remoteAddr, err := conn.ReadFrom(buf)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || sess.IsCancelled() {
 				return
 			}
 			sess.mu.Lock()
@@ -866,7 +1076,8 @@ func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn *net.UDPConn, s
 			sess.mu.Unlock()
 			return
 		}
-		if n <= 0 || remoteAddr.IP.String() != sess.ExpectedSourceIP {
+		sourceIP := extractIPString(remoteAddr)
+		if n <= 0 || sourceIP != sess.ExpectedSourceIP {
 			continue
 		}
 		seq, valErr := ValidateUDPPacketPayload(buf[:n], secret, sess.SessionID, sess.Nonce, sess.MaxPackets)
@@ -874,7 +1085,7 @@ func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn *net.UDPConn, s
 		if valErr != nil {
 			sess.InvalidPackets++
 			sess.mu.Unlock()
-			s.AddLog(fmt.Sprintf("⚠️ [Receiver] Ignored unverified UDP datagram from %s: %v", remoteAddr.IP.String(), valErr))
+			s.AddLog(fmt.Sprintf("⚠️ [Receiver] Ignored unverified UDP datagram from %s: %v", sourceIP, valErr))
 			continue
 		}
 		if sess.SeenSeq[seq] {
@@ -886,7 +1097,7 @@ func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn *net.UDPConn, s
 		sess.State = RecvRunning
 		rec := VerifiedPacketRecord{
 			Seq:          seq,
-			SourceIP:     remoteAddr.IP.String(),
+			SourceIP:     sourceIP,
 			Protocol:     "udp",
 			PayloadBytes: n,
 			Timestamp:    time.Now().Format("15:04:05.000"),
@@ -894,33 +1105,49 @@ func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn *net.UDPConn, s
 		sess.VerifiedPackets = append(sess.VerifiedPackets, rec)
 		sess.mu.Unlock()
 
-		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED UDP Packet #%d from Spoofed IP %s (Session=%s)", seq, remoteAddr.IP.String(), sess.SessionID[:8]))
+		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED UDP Packet #%d from Spoofed IP %s (Session=%s)", seq, sourceIP, sess.SessionID[:8]))
 	}
 }
 
 func (s *AppServer) runICMPReceiverLoop(ctx context.Context, conn net.PacketConn, sess *ReceiverSession, secret string) {
+	var closeOnce sync.Once
+	closeConn := func() {
+		closeOnce.Do(func() {
+			_ = conn.Close()
+		})
+	}
+
 	defer func() {
-		_ = conn.Close()
+		closeConn()
+		sess.Cancel()
+
+		finalServerState := RecvIdle
 		sess.mu.Lock()
-		if sess.State == RecvReady || sess.State == RecvRunning {
+		if sess.State == RecvReady || sess.State == RecvRunning || sess.State == RecvInitializing {
 			sess.State = RecvCompleted
+		} else if sess.State == RecvError {
+			finalServerState = RecvError
 		}
 		sess.mu.Unlock()
-		s.setLocalRecvState(RecvIdle)
-		close(sess.DoneChan)
+
+		s.onSessionExit(sess, finalServerState)
+		sess.markDone()
 		s.AddLog(fmt.Sprintf("🏁 [Receiver] ICMP session %s closed.", sess.SessionID[:8]))
 	}()
 
 	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			closeConn()
+		case <-sess.DoneChan:
+		}
 	}()
 
 	buf := make([]byte, 2048)
 	for {
 		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || sess.IsCancelled() {
 				return
 			}
 			sess.mu.Lock()
@@ -929,7 +1156,8 @@ func (s *AppServer) runICMPReceiverLoop(ctx context.Context, conn net.PacketConn
 			sess.mu.Unlock()
 			return
 		}
-		if n <= 0 || addr.String() != sess.ExpectedSourceIP {
+		sourceIP := extractIPString(addr)
+		if n <= 0 || sourceIP != sess.ExpectedSourceIP {
 			continue
 		}
 		seq, icmpID, icmpSeq, valErr := ValidateICMPRawPacket(buf[:n], secret, sess.SessionID, sess.Nonce, sess.MaxPackets)
@@ -946,7 +1174,7 @@ func (s *AppServer) runICMPReceiverLoop(ctx context.Context, conn net.PacketConn
 		sess.State = RecvRunning
 		rec := VerifiedPacketRecord{
 			Seq:          seq,
-			SourceIP:     addr.String(),
+			SourceIP:     sourceIP,
 			Protocol:     "icmp",
 			ICMPID:       icmpID,
 			ICMPSeq:      icmpSeq,
@@ -956,14 +1184,26 @@ func (s *AppServer) runICMPReceiverLoop(ctx context.Context, conn net.PacketConn
 		sess.VerifiedPackets = append(sess.VerifiedPackets, rec)
 		sess.mu.Unlock()
 
-		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED ICMP Echo Request #%d (ID=%d, ICMPSeq=%d) from Spoofed IP %s", seq, icmpID, icmpSeq, addr.String()))
+		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED ICMP Echo Request #%d (ID=%d, ICMPSeq=%d) from Spoofed IP %s", seq, icmpID, icmpSeq, sourceIP))
 	}
 }
 
-func (s *AppServer) setLocalRecvState(state string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.LocalReceiverState = state
+func extractIPString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return a.IP.String()
+	case *net.IPAddr:
+		return a.IP.String()
+	default:
+		s := addr.String()
+		if host, _, err := net.SplitHostPort(s); err == nil {
+			return host
+		}
+		return s
+	}
 }
 
 // Persistent Heartbeat & Connection State Machine
@@ -1039,7 +1279,6 @@ func (s *AppServer) performHeartbeatTick() {
 	s.LastHeartbeat = time.Now()
 	s.PeerReceiverState = respPayload.ReceiverState
 
-	// If we thought a session was prepared, but peer reports it is no longer ready/running, invalidate readiness
 	if s.PreparedSession != nil {
 		if respPayload.ActiveSessionID != s.PreparedSession.SessionID ||
 			(respPayload.ReceiverState != RecvReady && respPayload.ReceiverState != RecvRunning) {
@@ -1102,7 +1341,6 @@ func (s *AppServer) requirePeerTLSAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Verify HMAC signature using local PairingSecret (or paired SharedSecret)
 		expectedLocalSig := signPeerRequest(s.PairingSecret, r.Method, r.URL.Path, tsStr, bodyBytes)
 		validSig := subtle.ConstantTimeCompare([]byte(sig), []byte(expectedLocalSig)) == 1
 
@@ -1219,7 +1457,7 @@ func (s *AppServer) handlePeerPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.StartReceiverSession(req, s.PairingSecret)
+	resp, err := s.StartReceiverSessionWithContext(r.Context(), req, s.PairingSecret)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1251,19 +1489,22 @@ func (s *AppServer) handlePeerResults(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
-	sess := s.ActiveRecvSession
+	sess := s.SessionHistory[req.SessionID]
+	if sess == nil && s.ActiveRecvSession != nil && s.ActiveRecvSession.SessionID == req.SessionID {
+		sess = s.ActiveRecvSession
+	}
 	s.mu.RUnlock()
 
-	if sess == nil || sess.SessionID != req.SessionID {
+	if sess == nil {
 		http.Error(w, "Session not found on receiver", http.StatusNotFound)
 		return
 	}
 
 	if req.StopSession {
-		sess.CancelFunc()
+		sess.Cancel()
 		select {
 		case <-sess.DoneChan:
-		case <-time.After(2 * time.Second):
+		case <-time.After(3 * time.Second):
 		}
 	}
 
@@ -1446,23 +1687,23 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 }
 
 type AdminTestResult struct {
-	SessionID              string                 `json:"session_id"`
-	PrimaryClassification  string                 `json:"primary_classification"`
-	Classifications        []string               `json:"classifications"`
-	PacketsAttempted       int                    `json:"packets_attempted"`
-	PacketsSent            int                    `json:"packets_sent"`
-	SNATPacketsMatched     int                    `json:"snat_packets_matched"`
-	SNATBytesMatched       int                    `json:"snat_bytes_matched"`
-	RemoteVerifiedCount    int                    `json:"remote_verified_count"`
-	RemoteInvalidCount     int                    `json:"remote_invalid_count"`
-	RemoteDuplicateCount   int                    `json:"remote_duplicate_count"`
-	VerifiedPackets        []VerifiedPacketRecord `json:"verified_packets"`
-	OutgoingInterface      string                 `json:"outgoing_interface"`
-	IsolatedChainName      string                 `json:"isolated_chain_name"`
-	StatusClass            string                 `json:"status_class"`
-	ResultTitle            string                 `json:"result_title"`
-	ConfirmedEvidence      string                 `json:"confirmed_evidence"`
-	PossibleExplanations   string                 `json:"possible_explanations"`
+	SessionID             string                 `json:"session_id"`
+	PrimaryClassification string                 `json:"primary_classification"`
+	Classifications       []string               `json:"classifications"`
+	PacketsAttempted      int                    `json:"packets_attempted"`
+	PacketsSent           int                    `json:"packets_sent"`
+	SNATPacketsMatched    int                    `json:"snat_packets_matched"`
+	SNATBytesMatched      int                    `json:"snat_bytes_matched"`
+	RemoteVerifiedCount   int                    `json:"remote_verified_count"`
+	RemoteInvalidCount    int                    `json:"remote_invalid_count"`
+	RemoteDuplicateCount  int                    `json:"remote_duplicate_count"`
+	VerifiedPackets       []VerifiedPacketRecord `json:"verified_packets"`
+	OutgoingInterface     string                 `json:"outgoing_interface"`
+	IsolatedChainName     string                 `json:"isolated_chain_name"`
+	StatusClass           string                 `json:"status_class"`
+	ResultTitle           string                 `json:"result_title"`
+	ConfirmedEvidence     string                 `json:"confirmed_evidence"`
+	PossibleExplanations  string                 `json:"possible_explanations"`
 }
 
 func (s *AppServer) handleAdminTest(w http.ResponseWriter, r *http.Request) {
@@ -1512,7 +1753,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		Classifications:  []string{},
 	}
 
-	// Always stop receiver listener when test finishes
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -1523,7 +1763,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		}, &dummy, 3*time.Second)
 	}()
 
-	// 1. Resolve Outgoing Interface via `ip route get TARGET_IP`
 	iface, err := s.ResolveOutgoingInterface(ctx, targetIP)
 	if err != nil {
 		s.AddLog(fmt.Sprintf("[-] [Routing] %v", err))
@@ -1537,7 +1776,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	}
 	res.OutgoingInterface = iface
 
-	// 2. Create Isolated iptables SNAT Chain
 	shortID := prep.SessionID[:8]
 	chainIso, err := s.SetupIsolatedSNATChain(ctx, shortID, iface, targetIP, prep.ExpectedSourceIP, prep.TestType, prep.UDPPort)
 	if err != nil {
@@ -1554,7 +1792,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	res.IsolatedChainName = chainIso.ChainName
 	s.AddLog(fmt.Sprintf("[Sender] Created isolated SNAT chain %s on interface %s -> to:%s", chainIso.ChainName, iface, prep.ExpectedSourceIP))
 
-	// 3. Send Cryptographically Signed Packets & Track Actual Sent Count
 	packetsSent := 0
 	var sendExecErr error
 
@@ -1584,7 +1821,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 			}
 		}
 	} else {
-		// ICMP: Send each packet via `ping` with a unique per-sequence 16-byte signed hex pattern
 		for seq := 1; seq <= prep.PacketCount; seq++ {
 			patHex, pErr := BuildICMPPatternHex(peer.SharedSecret, prep.SessionID, prep.Nonce, seq)
 			if pErr != nil {
@@ -1596,7 +1832,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 			cancel()
 
 			outStr := string(out)
-			// In iputils-ping, exitCode 0 (reply received) or 1 (transmitted, 0 received) with "1 packets transmitted" confirms transmission
 			if strings.Contains(outStr, "1 packets transmitted") || strings.Contains(outStr, "1عملیات") || exitCode == 0 || (exitCode == 1 && strings.Contains(outStr, "transmitted")) {
 				packetsSent++
 			} else {
@@ -1621,7 +1856,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		s.AddLog(fmt.Sprintf("[Sender] Local packet generation: %d/%d packets transmitted.", packetsSent, prep.PacketCount))
 	}
 
-	// 4. Inspect Isolated SNAT Chain Counters
 	snatPkts, snatBytes, _, counterErr := chainIso.ReadCounters(ctx)
 	if counterErr == nil {
 		res.SNATPacketsMatched = snatPkts
@@ -1632,10 +1866,8 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		}
 	}
 
-	// Allow brief in-flight window for packets already on the wire to reach Server B before querying final tally
 	time.Sleep(450 * time.Millisecond)
 
-	// 5. Collect Cryptographically Verified Packet Report from Server B
 	var remoteReport PeerSessionReportResponse
 	repCtx, repCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer repCancel()
@@ -1680,7 +1912,6 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		return res
 	}
 
-	// Zero packets verified on remote receiver
 	res.PrimaryClassification = ClassRemoteNotReceived
 	res.Classifications = append(res.Classifications, ClassRemoteNotReceived)
 	res.StatusClass = "failure"
@@ -2206,7 +2437,6 @@ func (s *AppServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Verify cookie or query param before rendering dashboard
 	cookieKey := ""
 	if c, err := r.Cookie("cspf_admin_key"); err == nil {
 		cookieKey = c.Value
@@ -2327,9 +2557,17 @@ func serveMultiplexed(rawLn net.Listener, tlsCert tls.Certificate, handler http.
 			}
 			pc := &peekedConn{Conn: c, peeked: first[:n]}
 			if first[0] == 0x16 {
-				tlsCh.ch <- pc
+				select {
+				case tlsCh.ch <- pc:
+				case <-tlsCh.done:
+					_ = pc.Close()
+				}
 			} else {
-				httpCh.ch <- pc
+				select {
+				case httpCh.ch <- pc:
+				case <-httpCh.done:
+					_ = pc.Close()
+				}
 			}
 		}(conn)
 	}
@@ -2412,20 +2650,27 @@ func (s *AppServer) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
 
-	// Authenticated Admin APIs
 	mux.HandleFunc("/api/admin/pair", s.requireAdminAuth(s.handleAdminPair))
 	mux.HandleFunc("/api/admin/prepare", s.requireAdminAuth(s.handleAdminPrepare))
 	mux.HandleFunc("/api/admin/test", s.requireAdminAuth(s.handleAdminTest))
 	mux.HandleFunc("/api/admin/status", s.requireAdminAuth(s.handleAdminStatus))
 	mux.HandleFunc("/api/admin/clear-logs", s.requireAdminAuth(s.handleAdminClearLogs))
 
-	// TLS 1.3 + HMAC Authenticated Inter-Server Peer APIs
 	mux.HandleFunc("/api/peer/pair", s.requirePeerTLSAuth(s.handlePeerPair))
 	mux.HandleFunc("/api/peer/heartbeat", s.requirePeerTLSAuth(s.handlePeerHeartbeat))
 	mux.HandleFunc("/api/peer/prepare", s.requirePeerTLSAuth(s.handlePeerPrepare))
 	mux.HandleFunc("/api/peer/results", s.requirePeerTLSAuth(s.handlePeerResults))
 
 	return mux
+}
+
+// Shutdown cleanly stops background loops, active receiver sessions, and firewall rules.
+func (s *AppServer) Shutdown() {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
+	s.StopActiveReceiverSession()
+	s.CleanupAllChains()
 }
 
 func main() {
@@ -2439,17 +2684,14 @@ func main() {
 	}
 	srv.Port = activePort
 
-	// Clean up any stale CSPF_ iptables chains from prior interrupted runs
 	srv.CleanupAllChains()
 
-	// Graceful shutdown handler for SIGINT / SIGTERM
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		fmt.Println("\n[+] Shutting down CheckSpoof and cleaning up temporary firewall chains...")
-		close(srv.stopCh)
-		srv.CleanupAllChains()
+		srv.Shutdown()
 		_ = listener.Close()
 		os.Exit(0)
 	}()
