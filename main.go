@@ -54,21 +54,25 @@ const (
 	RecvError        = "ERROR"
 )
 
-// Test Result Classifications
+// Test Result Classifications (Strictly Separated Stages & Verdicts)
 const (
-	ClassLocalGenSuccess     = "LOCAL_PACKET_GENERATION_SUCCESS"
-	ClassLocalRuleMatched    = "LOCAL_FIREWALL_RULE_MATCHED"
-	ClassRemoteVerified      = "REMOTE_PACKET_VERIFIED"
-	ClassRemoteNotReceived   = "REMOTE_PACKET_NOT_RECEIVED"
-	ClassReceiverUnavailable = "RECEIVER_UNAVAILABLE"
-	ClassPermissionError     = "LOCAL_PERMISSION_ERROR"
-	ClassRoutingError        = "ROUTING_ERROR"
-	ClassTestIncomplete      = "TEST_INCOMPLETE"
+	ClassReceiverListenerReady    = "RECEIVER_LISTENER_READY"
+	ClassSNATRuleInstalled        = "SNAT_RULE_INSTALLED"
+	ClassLocalGenSuccess          = "LOCAL_PACKET_GENERATION_SUCCESS"
+	ClassLocalRuleMatched         = "LOCAL_FIREWALL_RULE_MATCHED"
+	ClassSpoofSuccess             = "SPOOF_SUCCESS"
+	ClassSimulatedControlVerified = "SIMULATED_CONTROL_FLOW_VERIFIED"
+	ClassRemoteNotReceived        = "REMOTE_PACKET_NOT_RECEIVED"
+	ClassReceiverUnavailable      = "RECEIVER_UNAVAILABLE"
+	ClassPermissionError          = "LOCAL_PERMISSION_ERROR"
+	ClassRoutingError             = "ROUTING_ERROR"
+	ClassTestIncomplete           = "TEST_INCOMPLETE"
 )
 
 // CommandRunner abstracts OS command execution for unit testing and security isolation.
 type CommandRunner interface {
 	Run(ctx context.Context, name string, args ...string) ([]byte, int, error)
+	IsMock() bool
 }
 
 type RealCommandRunner struct{}
@@ -88,8 +92,11 @@ func (r *RealCommandRunner) Run(ctx context.Context, name string, args ...string
 	return out, exitCode, err
 }
 
-// PacketListenerBinder abstracts UDP and Raw ICMP listener binding so startup cancellation
-// and concurrent preparation can be deterministically tested without arbitrary sleeps.
+func (r *RealCommandRunner) IsMock() bool {
+	return false
+}
+
+// PacketListenerBinder abstracts UDP and Raw ICMP listener binding.
 type PacketListenerBinder interface {
 	ListenUDP(ctx context.Context, network string, laddr *net.UDPAddr) (net.PacketConn, error)
 	ListenICMP(ctx context.Context, network, address string) (net.PacketConn, error)
@@ -145,7 +152,6 @@ type ReceiverSession struct {
 	DuplicateCount  int
 }
 
-// Cancel safely and idempotently cancels the receiver session.
 func (rs *ReceiverSession) Cancel() {
 	rs.mu.Lock()
 	rs.cancelled = true
@@ -158,21 +164,18 @@ func (rs *ReceiverSession) Cancel() {
 	})
 }
 
-// IsCancelled returns true if Cancel() has been invoked on this session.
 func (rs *ReceiverSession) IsCancelled() bool {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	return rs.cancelled
 }
 
-// GetState returns the current session state safely.
 func (rs *ReceiverSession) GetState() string {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	return rs.State
 }
 
-// markDone closes DoneChan exactly once.
 func (rs *ReceiverSession) markDone() {
 	rs.doneOnce.Do(func() {
 		close(rs.DoneChan)
@@ -200,8 +203,6 @@ type PreparedSessionInfo struct {
 
 // AppServer encapsulates the entire state of a CheckSpoof node.
 type AppServer struct {
-	// prepMu serializes receiver session preparation transitions so concurrent callers
-	// cleanly replace the prior session one at a time without holding s.mu while waiting.
 	prepMu sync.Mutex
 
 	mu              sync.RWMutex
@@ -319,7 +320,6 @@ func ParsePairingToken(token string) (*PeerConfig, error) {
 	}, nil
 }
 
-// generateSelfSignedCert creates an in-memory ECDSA P-256 certificate and returns its SHA-256 fingerprint.
 func generateSelfSignedCert(ipStr string) (tls.Certificate, string, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -363,13 +363,12 @@ func generateSelfSignedCert(ipStr string) (tls.Certificate, string, error) {
 	return tlsCert, fp, err
 }
 
-// buildPeerTLSClient builds an HTTPS client that pins the peer's SHA-256 certificate fingerprint.
 func (s *AppServer) buildPeerTLSClient(expectedFP string, timeout time.Duration) *http.Client {
 	expectedFP = strings.ToLower(strings.TrimSpace(expectedFP))
 	tlsCfg := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		Certificates:       []tls.Certificate{s.TLSCert},
-		InsecureSkipVerify: true, // Verified explicitly in VerifyPeerCertificate below
+		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			if len(rawCerts) == 0 {
 				return errors.New("peer presented no TLS certificate")
@@ -392,7 +391,6 @@ func (s *AppServer) buildPeerTLSClient(expectedFP string, timeout time.Duration)
 	}
 }
 
-// signPeerRequest computes HMAC-SHA256 over method, path, timestamp, and body using the shared secret.
 func signPeerRequest(secret, method, path, timestamp string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(method + "|" + path + "|" + timestamp + "|"))
@@ -443,7 +441,6 @@ func (s *AppServer) doPeerRequest(ctx context.Context, peer *PeerConfig, path st
 
 // Packet Framing & Cryptographic Verification
 
-// BuildUDPPacketPayload creates a signed ASCII frame: CSPFv2|<SessionID>|udp|<Seq>|<TimestampMS>|<Nonce>|<HMAC>
 func BuildUDPPacketPayload(secret, sessionID, nonce string, seq int, tsMillis int64) []byte {
 	core := fmt.Sprintf("CSPFv2|%s|udp|%d|%d|%s", sessionID, seq, tsMillis, nonce)
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -452,7 +449,6 @@ func BuildUDPPacketPayload(secret, sessionID, nonce string, seq int, tsMillis in
 	return []byte(core + "|" + sig)
 }
 
-// ValidateUDPPacketPayload verifies a CSPFv2 UDP payload against the session parameters and secret.
 func ValidateUDPPacketPayload(payload []byte, secret, expectedSessionID, expectedNonce string, maxPackets int) (int, error) {
 	parts := strings.Split(strings.TrimSpace(string(payload)), "|")
 	if len(parts) != 7 {
@@ -489,8 +485,6 @@ func ValidateUDPPacketPayload(payload []byte, secret, expectedSessionID, expecte
 	return seq, nil
 }
 
-// BuildICMPPatternHex builds a 16-byte (32 hex char) signed binary frame for `ping -p`:
-// [0xC5 (1B)][SessionID prefix (4B)][Seq (1B)][Nonce prefix (4B)][HMAC-SHA256 truncated (6B)]
 func BuildICMPPatternHex(secret, sessionID, nonce string, seq int) (string, error) {
 	sessBytes, err := hex.DecodeString(sessionID)
 	if err != nil || len(sessBytes) < 4 {
@@ -517,7 +511,6 @@ func BuildICMPPatternHex(secret, sessionID, nonce string, seq int) (string, erro
 	return hex.EncodeToString(frame), nil
 }
 
-// ValidateICMPRawPacket validates a raw ICMP packet (Type 8, Code 0, ID, Seq, and 16-byte signed pattern).
 func ValidateICMPRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNonce string, maxPackets int) (seq int, icmpID uint16, icmpSeq uint16, err error) {
 	if len(rawPkt) < 24 {
 		return 0, 0, 0, errors.New("ICMP packet too short")
@@ -775,20 +768,15 @@ type PeerPrepareResponse struct {
 	Message       string `json:"message"`
 }
 
-// StartReceiverSession prepares a new receiver session using context.Background().
 func (s *AppServer) StartReceiverSession(req PeerPrepareRequest, sharedSecret string) (*PeerPrepareResponse, error) {
 	return s.StartReceiverSessionWithContext(context.Background(), req, sharedSecret)
 }
 
-// StartReceiverSessionWithContext safely detaches, cancels, and awaits any prior receiver session
-// without holding s.mu, serializes concurrent preparation requests via s.prepMu, fences state
-// updates via s.recvGen, and cleans up partial resources if cancelled during startup.
 func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, req PeerPrepareRequest, sharedSecret string) (*PeerPrepareResponse, error) {
 	if callerCtx == nil {
 		callerCtx = context.Background()
 	}
 
-	// Validate request parameters before acquiring lifecycle locks
 	if !isValidIPv4(req.ExpectedSourceIP) {
 		return nil, errors.New("invalid expected_source_ip")
 	}
@@ -811,12 +799,9 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 		req.Nonce = randomHex(16)
 	}
 
-	// Serialize session preparation transitions so two concurrent callers cannot race
-	// to bind the same port simultaneously.
 	s.prepMu.Lock()
 	defer s.prepMu.Unlock()
 
-	// 1. Detach any previous session and register the new initializing session under s.mu.
 	s.mu.Lock()
 	oldSess := s.ActiveRecvSession
 	s.recvGen++
@@ -853,7 +838,6 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 	s.LocalReceiverState = RecvInitializing
 	s.mu.Unlock()
 
-	// Propagate callerCtx cancellation or server stop to sess.Cancel()
 	watchDone := make(chan struct{})
 	go func() {
 		select {
@@ -867,13 +851,11 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 	}()
 	defer close(watchDone)
 
-	// 2. If a prior session existed, cancel it and wait for its full cleanup WITHOUT holding s.mu!
 	if oldSess != nil {
 		oldSess.Cancel()
 		<-oldSess.DoneChan
 	}
 
-	// 3. Check if this new session was cancelled while waiting for the old session to stop.
 	if sess.IsCancelled() || sessCtx.Err() != nil || callerCtx.Err() != nil {
 		s.abortStartupSession(sess, RecvIdle, "session cancelled before listener initialization")
 		return nil, errors.New("receiver session cancelled before listener initialization")
@@ -884,7 +866,6 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 		binder = &RealListenerBinder{}
 	}
 
-	// 4. Bind the requested socket (without holding s.mu).
 	if req.TestType == "udp" {
 		bindAddr := fmt.Sprintf("0.0.0.0:%d", req.UDPPort)
 		udpAddr, err := net.ResolveUDPAddr("udp4", bindAddr)
@@ -899,7 +880,6 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 			return nil, fmt.Errorf("UDP socket bind failed on %s: %v", bindAddr, err)
 		}
 
-		// Atomically verify the session was not cancelled while ListenUDP was running.
 		sess.mu.Lock()
 		if sess.cancelled || sessCtx.Err() != nil || callerCtx.Err() != nil {
 			sess.State = RecvError
@@ -930,7 +910,6 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 		}, nil
 	}
 
-	// Raw ICMP Listener
 	conn, err := binder.ListenICMP(sessCtx, "ip4:icmp", "0.0.0.0")
 	if err != nil {
 		s.abortStartupSession(sess, RecvError, err.Error())
@@ -967,7 +946,6 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 	}, nil
 }
 
-// abortStartupSession cleans up a session that failed or was cancelled during startup.
 func (s *AppServer) abortStartupSession(sess *ReceiverSession, serverState string, errMsg string) {
 	sess.Cancel()
 
@@ -988,7 +966,6 @@ func (s *AppServer) abortStartupSession(sess *ReceiverSession, serverState strin
 	sess.markDone()
 }
 
-// onSessionExit updates AppServer's LocalReceiverState only if sess is still the current generation.
 func (s *AppServer) onSessionExit(sess *ReceiverSession, finalServerState string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -997,7 +974,6 @@ func (s *AppServer) onSessionExit(sess *ReceiverSession, finalServerState string
 	}
 }
 
-// StopActiveReceiverSession cancels the active receiver session (if any) and waits for cleanup.
 func (s *AppServer) StopActiveReceiverSession() {
 	s.mu.RLock()
 	sess := s.ActiveRecvSession
@@ -1008,8 +984,6 @@ func (s *AppServer) StopActiveReceiverSession() {
 	}
 }
 
-// CancelReceiverSession cancels a specific session ID (or the active session if sessionID == "")
-// and waits for its cleanup to finish.
 func (s *AppServer) CancelReceiverSession(sessionID string) bool {
 	s.mu.RLock()
 	var sess *ReceiverSession
@@ -1105,7 +1079,7 @@ func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn net.PacketConn,
 		sess.VerifiedPackets = append(sess.VerifiedPackets, rec)
 		sess.mu.Unlock()
 
-		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED UDP Packet #%d from Spoofed IP %s (Session=%s)", seq, sourceIP, sess.SessionID[:8]))
+		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED UDP Packet #%d from Source IP %s (Session=%s)", seq, sourceIP, sess.SessionID[:8]))
 	}
 }
 
@@ -1184,7 +1158,7 @@ func (s *AppServer) runICMPReceiverLoop(ctx context.Context, conn net.PacketConn
 		sess.VerifiedPackets = append(sess.VerifiedPackets, rec)
 		sess.mu.Unlock()
 
-		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED ICMP Echo Request #%d (ID=%d, ICMPSeq=%d) from Spoofed IP %s", seq, icmpID, icmpSeq, sourceIP))
+		s.AddLog(fmt.Sprintf("🎯 [Receiver] VERIFIED ICMP Echo Request #%d (ID=%d, ICMPSeq=%d) from Source IP %s", seq, icmpID, icmpSeq, sourceIP))
 	}
 }
 
@@ -1686,10 +1660,17 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// AdminTestResult explicitly separates receiver readiness, SNAT rule installation,
+// local packet generation, local rule counter matching, and genuine remote spoof reception.
 type AdminTestResult struct {
 	SessionID             string                 `json:"session_id"`
 	PrimaryClassification string                 `json:"primary_classification"`
 	Classifications       []string               `json:"classifications"`
+	ReceiverListenerReady bool                   `json:"receiver_listener_ready"`
+	SNATRuleInstalled     bool                   `json:"snat_rule_installed"`
+	LocalPacketGenSuccess bool                   `json:"local_packet_gen_success"`
+	RemoteSpoofVerified   bool                   `json:"remote_spoof_verified"`
+	IsLoopbackOrSimulated bool                   `json:"is_loopback_or_simulated"`
 	PacketsAttempted      int                    `json:"packets_attempted"`
 	PacketsSent           int                    `json:"packets_sent"`
 	SNATPacketsMatched    int                    `json:"snat_packets_matched"`
@@ -1745,12 +1726,37 @@ func (s *AppServer) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(result)
 }
 
+// isGenuineNetworkSpoofSetup returns true only if:
+// 1. The command runner is executing real OS commands (not a mock runner).
+// 2. TargetIP, SenderIP, and SpoofIP are non-loopback, routable IPv4 addresses.
+// 3. SpoofIP is distinct from the sender's own IP and target's IP.
+func (s *AppServer) isGenuineNetworkSpoofSetup(targetIP, spoofIP string) (bool, string) {
+	if s.Runner == nil || s.Runner.IsMock() {
+		return false, "mocked CommandRunner is in use (iptables SNAT not applied to real kernel netfilter)"
+	}
+	tIP := net.ParseIP(strings.TrimSpace(targetIP))
+	spIP := net.ParseIP(strings.TrimSpace(spoofIP))
+	srvIP := net.ParseIP(strings.TrimSpace(s.ServerIP))
+
+	if tIP == nil || spIP == nil {
+		return false, "invalid target or spoof IPv4 address"
+	}
+	if tIP.IsLoopback() || spIP.IsLoopback() || (srvIP != nil && srvIP.IsLoopback()) {
+		return false, fmt.Sprintf("loopback address detected (sender=%s, target=%s, spoof=%s); loopback traffic bypasses physical NICs and upstream routers", s.ServerIP, targetIP, spoofIP)
+	}
+	if srvIP != nil && spIP.Equal(srvIP) {
+		return false, fmt.Sprintf("spoof_ip (%s) is identical to sender's own IP (%s); no source IP spoofing occurred", spoofIP, s.ServerIP)
+	}
+	return true, ""
+}
+
 func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig, prep *PreparedSessionInfo) AdminTestResult {
 	targetIP := peer.PublicIP
 	res := AdminTestResult{
-		SessionID:        prep.SessionID,
-		PacketsAttempted: prep.PacketCount,
-		Classifications:  []string{},
+		SessionID:             prep.SessionID,
+		PacketsAttempted:      prep.PacketCount,
+		ReceiverListenerReady: true,
+		Classifications:       []string{ClassReceiverListenerReady},
 	}
 
 	defer func() {
@@ -1763,6 +1769,7 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		}, &dummy, 3*time.Second)
 	}()
 
+	// Stage 1: Route & Interface Resolution
 	iface, err := s.ResolveOutgoingInterface(ctx, targetIP)
 	if err != nil {
 		s.AddLog(fmt.Sprintf("[-] [Routing] %v", err))
@@ -1776,6 +1783,7 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	}
 	res.OutgoingInterface = iface
 
+	// Stage 2: Isolated iptables SNAT Chain Installation
 	shortID := prep.SessionID[:8]
 	chainIso, err := s.SetupIsolatedSNATChain(ctx, shortID, iface, targetIP, prep.ExpectedSourceIP, prep.TestType, prep.UDPPort)
 	if err != nil {
@@ -1783,15 +1791,18 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		res.PrimaryClassification = ClassPermissionError
 		res.Classifications = append(res.Classifications, ClassPermissionError)
 		res.StatusClass = "failure"
-		res.ResultTitle = "❌ خطای دسترسی یا فایروال محلی (LOCAL_PERMISSION_ERROR)"
+		res.ResultTitle = "❌ خطای دسترسی یا نصب فایروال محلی (LOCAL_PERMISSION_ERROR)"
 		res.ConfirmedEvidence = fmt.Sprintf("ایجاد زنجیره ایزوله iptables شکست خورد: %v", err)
 		res.PossibleExplanations = "برنامه بدون دسترسی root / CAP_NET_ADMIN اجرا شده یا ماژول nat کرنل فعال نیست."
 		return res
 	}
 	defer chainIso.Cleanup()
+	res.SNATRuleInstalled = true
 	res.IsolatedChainName = chainIso.ChainName
-	s.AddLog(fmt.Sprintf("[Sender] Created isolated SNAT chain %s on interface %s -> to:%s", chainIso.ChainName, iface, prep.ExpectedSourceIP))
+	res.Classifications = append(res.Classifications, ClassSNATRuleInstalled)
+	s.AddLog(fmt.Sprintf("[Sender] Installed isolated SNAT chain %s on interface %s -> to:%s", chainIso.ChainName, iface, prep.ExpectedSourceIP))
 
+	// Stage 3: Local Packet Generation
 	packetsSent := 0
 	var sendExecErr error
 
@@ -1852,10 +1863,12 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 
 	res.PacketsSent = packetsSent
 	if packetsSent > 0 {
+		res.LocalPacketGenSuccess = true
 		res.Classifications = append(res.Classifications, ClassLocalGenSuccess)
-		s.AddLog(fmt.Sprintf("[Sender] Local packet generation: %d/%d packets transmitted.", packetsSent, prep.PacketCount))
+		s.AddLog(fmt.Sprintf("[Sender] Local packet generation: %d/%d packets written to socket.", packetsSent, prep.PacketCount))
 	}
 
+	// Stage 4: Local SNAT Rule Counter Inspection
 	snatPkts, snatBytes, _, counterErr := chainIso.ReadCounters(ctx)
 	if counterErr == nil {
 		res.SNATPacketsMatched = snatPkts
@@ -1868,6 +1881,7 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 
 	time.Sleep(450 * time.Millisecond)
 
+	// Stage 5: Remote Receiver Packet Reception & Source IP Verification
 	var remoteReport PeerSessionReportResponse
 	repCtx, repCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer repCancel()
@@ -1887,7 +1901,15 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		return res
 	}
 
-	res.RemoteVerifiedCount = remoteReport.VerifiedCount
+	// Count only packets whose observed remote SourceIP strictly matches prep.ExpectedSourceIP
+	matchingSpoofSourceCount := 0
+	for _, vp := range remoteReport.VerifiedPackets {
+		if vp.SourceIP == prep.ExpectedSourceIP {
+			matchingSpoofSourceCount++
+		}
+	}
+
+	res.RemoteVerifiedCount = matchingSpoofSourceCount
 	res.RemoteInvalidCount = remoteReport.InvalidCount
 	res.RemoteDuplicateCount = remoteReport.DuplicateCount
 	res.VerifiedPackets = remoteReport.VerifiedPackets
@@ -1902,23 +1924,110 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		return res
 	}
 
-	if remoteReport.VerifiedCount > 0 {
-		res.PrimaryClassification = ClassRemoteVerified
-		res.Classifications = append(res.Classifications, ClassRemoteVerified)
+	if matchingSpoofSourceCount > 0 {
+		genuineNet, simReason := s.isGenuineNetworkSpoofSetup(targetIP, prep.ExpectedSourceIP)
+		if !genuineNet {
+			// NEVER report SPOOF_SUCCESS on loopback, mocked iptables, or unspoofed source IPs
+			res.IsLoopbackOrSimulated = true
+			res.RemoteSpoofVerified = false
+			res.PrimaryClassification = ClassSimulatedControlVerified
+			res.Classifications = append(res.Classifications, ClassSimulatedControlVerified)
+			res.StatusClass = "warning"
+			res.ResultTitle = "⚠️ تست کنترلی/لوپ‌بک انجام شد — اثبات‌کننده IP Spoofing واقعی نیست (SIMULATED_CONTROL_FLOW_VERIFIED)"
+			res.ConfirmedEvidence = fmt.Sprintf("گیرنده %d پکت با امضای معتبر دریافت کرد، اما این تست به دلیل [%s] به عنوان SPOOF_SUCCESS ثبت نمی‌شود.", matchingSpoofSourceCount, simReason)
+			res.PossibleExplanations = "تست روی 127.0.0.1، فایروال شبیه‌سازی‌شده (Mock) یا IP یکسان با مبدا صرفاً صحت کانال کنترلی و فریم‌بندی پکت‌ها را می‌سنجد و عبور پکت اسپوف‌شده از کارت شبکه و روترهای واقعی را اثبات نمی‌کند."
+			return res
+		}
+
+		res.RemoteSpoofVerified = true
+		res.PrimaryClassification = ClassSpoofSuccess
+		res.Classifications = append(res.Classifications, ClassSpoofSuccess)
 		res.StatusClass = "success"
-		res.ResultTitle = "✅ تایید قطعی دریافت پکت اسپوف‌شده در مقصد (REMOTE_PACKET_VERIFIED)"
-		res.ConfirmedEvidence = fmt.Sprintf("شواهد قطعی: %d پکت ارسال شد، %d پکت از زنجیره ایزوله %s عبور کرد و سرور دوم دقیقاً %d پکت با آدرس مبدا جعلی (%s) و امضای رمزنگاری معتبر دریافت کرد.", packetsSent, snatPkts, chainIso.ChainName, remoteReport.VerifiedCount, prep.ExpectedSourceIP)
-		res.PossibleExplanations = "مسیر شبکه بین سرور اول و سرور دوم فاقد فیلترینگ خروجی مبدا (Egress Filtering / uRPF) برای این پروتکل و رنج آدرس است."
+		res.ResultTitle = "✅ تایید قطعی IP Spoofing در سرور دوم (SPOOF_SUCCESS)"
+		res.ConfirmedEvidence = fmt.Sprintf("شواهد تفکیک‌شده: ۱) شنونده مقصد آماده بود، ۲) زنجیره SNAT (%s) نصب شد، ۳) %d پکت در مبدا تولید شد، ۴) %d پکت در کرنل تغییر مبدا یافت و ۵) سرور دوم (%s) دقیقاً %d پکت رمزنگاری‌شده با آدرس مبدا اسپوف‌شده (%s) دریافت و تایید کرد.", chainIso.ChainName, packetsSent, snatPkts, targetIP, matchingSpoofSourceCount, prep.ExpectedSourceIP)
+		res.PossibleExplanations = "شبکه مبدا و مسیر بین دو سرور، پکت‌های دارای آدرس مبدا جعلی (Spoofed Source IP) را مسدود نکرده‌اند."
 		return res
 	}
 
+	res.RemoteSpoofVerified = false
 	res.PrimaryClassification = ClassRemoteNotReceived
 	res.Classifications = append(res.Classifications, ClassRemoteNotReceived)
 	res.StatusClass = "failure"
-	res.ResultTitle = "❌ عدم دریافت پکت در سرور دوم (REMOTE_PACKET_NOT_RECEIVED)"
-	res.ConfirmedEvidence = fmt.Sprintf("شواهد ثبت‌شده: %d پکت در سرور اول تولید شد و %d پکت (%d بایت) در زنجیره ایزوله %s تغییر آدرس مبدا یافت، اما سرور دوم ۰ پکت معتبر دریافت کرد. (توجه: افزایش شمارنده SNAT صرفاً عبور از لایه netfilter کرنل را نشان می‌دهد و اثبات خروج فیزیکی یا عبور از روتر نیست.)", packetsSent, snatPkts, snatBytes, chainIso.ChainName)
-	res.PossibleExplanations = "دلایل محتمل: ۱) اعمال فیلترینگ مبدا در روتر بالادست یا دیتاسنتر فرستنده (BCP 38 / uRPF)، ۲) دراپ شدن پکت در مسیر ترانزیت، ۳) مسدود بودن پورت یا پروتکل در فایروال ورودی سرور دوم، ۴) انتخاب نادرست کارت شبکه یا از دست رفتن پکت در شبکه."
+	res.ResultTitle = "❌ عدم دریافت پکت اسپوف‌شده در سرور دوم (REMOTE_PACKET_NOT_RECEIVED)"
+	res.ConfirmedEvidence = fmt.Sprintf("شواهد تفکیک‌شده: ۱) شنونده مقصد آماده بود، ۲) زنجیره SNAT (%s) نصب شد، ۳) %d پکت در مبدا تولید شد و ۴) %d پکت (%d بایت) با قانون SNAT محلی تطابق یافت؛ اما ۵) سرور دوم ۰ پکت با آدرس اسپوف‌شده (%s) دریافت کرد. (نصب قانون یا افزایش شمارنده SNAT به تنهایی دلیل موفقیت اسپوفینگ نیست.)", chainIso.ChainName, packetsSent, snatPkts, snatBytes, prep.ExpectedSourceIP)
+	res.PossibleExplanations = "دلایل محتمل: ۱) فیلترینگ مبدا در روتر بالادست یا دیتاسنتر فرستنده (BCP 38 / uRPF)، ۲) مسدود شدن در فایروال مسیر یا سرور مقصد، ۳) عدم تطابق مسیر خروجی یا از دست رفتن پکت در شبکه."
 	return res
+}
+
+// RunRealVPSIntegrationTest executes a complete two-server spoofing verification test
+// from the command line or automated integration suite against a paired remote Linux VPS.
+func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, spoofIP, testMethod string, packetCount int) (AdminTestResult, error) {
+	peerCfg, err := ParsePairingToken(peerToken)
+	if err != nil {
+		return AdminTestResult{}, fmt.Errorf("invalid peer token: %w", err)
+	}
+	if !isValidIPv4(spoofIP) {
+		return AdminTestResult{}, fmt.Errorf("invalid spoof IPv4 address: %s", spoofIP)
+	}
+	if testMethod != "udp" && testMethod != "icmp" {
+		return AdminTestResult{}, fmt.Errorf("unsupported test method %q (use udp or icmp)", testMethod)
+	}
+	if packetCount <= 0 || packetCount > 10 {
+		packetCount = 3
+	}
+
+	// Phase 1: Mutual TLS Pairing
+	pairReq := PeerPairRequest{
+		SenderServerID:        s.ServerID,
+		SenderAddr:            fmt.Sprintf("%s:%s", s.ServerIP, s.Port),
+		SenderPublicIP:        s.ServerIP,
+		SenderCertFingerprint: s.CertFingerprint,
+		SenderSecret:          peerCfg.SharedSecret,
+	}
+	var pairResp PeerPairResponse
+	if err := s.doPeerRequest(ctx, peerCfg, "/api/peer/pair", pairReq, &pairResp, 5*time.Second); err != nil {
+		return AdminTestResult{}, fmt.Errorf("phase 1 TLS pairing failed: %w", err)
+	}
+
+	s.mu.Lock()
+	s.Peer = peerCfg
+	s.ConnState = ConnConnected
+	s.PeerReceiverState = pairResp.ReceiverState
+	s.LastHeartbeat = time.Now()
+	s.mu.Unlock()
+
+	// Phase 2: Explicit Receiver Listener Preparation
+	sessionID := randomHex(16)
+	nonce := randomHex(16)
+	prepReq := PeerPrepareRequest{
+		SessionID:        sessionID,
+		Nonce:            nonce,
+		ExpectedSourceIP: spoofIP,
+		TestType:         testMethod,
+		UDPPort:          5555,
+		MaxPackets:       packetCount,
+		TimeoutSec:       45,
+	}
+	var prepResp PeerPrepareResponse
+	if err := s.doPeerRequest(ctx, peerCfg, "/api/peer/prepare", prepReq, &prepResp, 5*time.Second); err != nil {
+		return AdminTestResult{}, fmt.Errorf("phase 2 receiver preparation failed: %w", err)
+	}
+	if prepResp.ReceiverState != RecvReady {
+		return AdminTestResult{}, fmt.Errorf("receiver did not report READY_TO_RECEIVE (got %s)", prepResp.ReceiverState)
+	}
+
+	prepInfo := &PreparedSessionInfo{
+		SessionID:        sessionID,
+		Nonce:            nonce,
+		ExpectedSourceIP: spoofIP,
+		TestType:         testMethod,
+		UDPPort:          5555,
+		PacketCount:      packetCount,
+	}
+
+	// Phase 3: Execute Coordinated Spoof Test & Verify Remote Reception
+	result := s.executeCoordinatedTest(ctx, peerCfg, prepInfo)
+	return result, nil
 }
 
 func (s *AppServer) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
@@ -2107,7 +2216,7 @@ const dashboardHTML = `<!DOCTYPE html>
         .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
         .metric-box { background: var(--bg-input); border: 1px solid var(--border); border-radius: 10px; padding: 10px; text-align: center; }
         .metric-box .m-title { font-size: 10.5px; color: var(--text-muted); margin-bottom: 3px; }
-        .metric-box .m-val { font-size: 15px; font-weight: 800; font-family: monospace; color: #fff; }
+        .metric-box .m-val { font-size: 13px; font-weight: 800; font-family: monospace; color: #fff; }
         .alert-box { padding: 12px 14px; border-radius: 10px; font-size: 12.5px; line-height: 1.65; display: none; }
         .alert-box.show { display: block; }
         .alert-box strong { display: block; font-size: 13.5px; margin-bottom: 4px; }
@@ -2126,7 +2235,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="brand-icon">🛡️</div>
                 <div class="brand-text">
                     <h1>CheckSpoof Enterprise v2</h1>
-                    <p>سامانه مهندسی تشخیص IP Spoofing با کنترل‌پلین TLS 1.3 و اعتبارسنجی رمزنگاری پکت‌ها</p>
+                    <p>سامانه مهندسی تشخیص IP Spoofing با تفکیک مراحل محلی و تایید واقعی در سرور دوم</p>
                 </div>
             </div>
             <div class="nav-pills">
@@ -2135,7 +2244,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="pill"><span>اینترفیس:</span><strong>{{.Iface}}</strong></div>
                 <div class="pill"><span>وضعیت اتصال:</span><strong id="conn_state_badge">DISCONNECTED</strong></div>
                 <div class="pill"><span>آمادگی گیرنده:</span><strong id="recv_state_badge">IDLE</strong></div>
-                <div class="pill"><span>آخرین ضربان (Heartbeat):</span><strong id="hb_badge">—</strong></div>
+                <div class="pill"><span>آخرین ضربان:</span><strong id="hb_badge">—</strong></div>
             </div>
         </header>
 
@@ -2213,25 +2322,25 @@ const dashboardHTML = `<!DOCTYPE html>
 
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">📊 ۲. شواهد تفکیک‌شده و مانیتورینگ زنده</h2>
+                    <h2 class="card-title">📊 ۲. مراحل تفکیک‌شده اعتبارسنجی</h2>
                     <span id="local_recv_badge" style="font-size:11.5px; color:var(--text-muted); font-family:monospace;">Local Receiver: IDLE</span>
                 </div>
 
                 <div class="metrics-grid">
                     <div class="metric-box">
-                        <div class="m-title">ارسال محلی (Sent)</div>
+                        <div class="m-title">۱. تولید پکت محلی</div>
                         <div class="m-val" id="m_sent">0</div>
                     </div>
                     <div class="metric-box">
-                        <div class="m-title">شمارنده زنجیره SNAT</div>
-                        <div class="m-val" id="m_snat" style="color:#facc15;">0</div>
+                        <div class="m-title">۲. نصب و شمارنده SNAT</div>
+                        <div class="m-val" id="m_snat" style="color:#facc15;">—</div>
                     </div>
                     <div class="metric-box">
-                        <div class="m-title">تایید رمزنگاری مقصد</div>
+                        <div class="m-title">۳. دریافت واقعی در مقصد</div>
                         <div class="m-val" id="m_verified" style="color:#4ade80;">0</div>
                     </div>
                     <div class="metric-box">
-                        <div class="m-title">طبقه نهایی (Verdict)</div>
+                        <div class="m-title">۴. نتیجه نهایی اسپوف</div>
                         <div class="m-val" id="m_class" style="font-size:11px;">NOT_TESTED</div>
                     </div>
                 </div>
@@ -2401,9 +2510,9 @@ const dashboardHTML = `<!DOCTYPE html>
                 return r.json();
             })
             .then(d => {
-                document.getElementById('m_sent').innerText = d.packets_sent + "/" + d.packets_attempted;
-                document.getElementById('m_snat').innerText = d.snat_packets_matched + " pkts";
-                document.getElementById('m_verified').innerText = d.remote_verified_count;
+                document.getElementById('m_sent').innerText = (d.local_packet_gen_success ? "OK " : "FAIL ") + "(" + d.packets_sent + "/" + d.packets_attempted + ")";
+                document.getElementById('m_snat').innerText = (d.snat_rule_installed ? "INSTALLED " : "FAIL ") + "(" + d.snat_packets_matched + " pkts)";
+                document.getElementById('m_verified').innerText = d.remote_verified_count + (d.remote_spoof_verified ? " (SPOOFED)" : "");
                 document.getElementById('m_class').innerText = d.primary_classification;
 
                 resBox.className = 'alert-box show ' + (d.status_class || 'failure');
@@ -2601,12 +2710,9 @@ func isValidIPv4(ipStr string) bool {
 	return ip != nil && ip.To4() != nil
 }
 
-func resolvePort() string {
-	cliPort := flag.String("port", "", "Port to run CheckSpoof on (default 8085)")
-	flag.Parse()
-
-	if *cliPort != "" {
-		return strings.TrimSpace(*cliPort)
+func promptPortIfEmpty(cliPort string) string {
+	if cliPort != "" {
+		return strings.TrimSpace(cliPort)
 	}
 	if envPort := os.Getenv("PORT"); envPort != "" {
 		return strings.TrimSpace(envPort)
@@ -2664,7 +2770,6 @@ func (s *AppServer) Routes() http.Handler {
 	return mux
 }
 
-// Shutdown cleanly stops background loops, active receiver sessions, and firewall rules.
 func (s *AppServer) Shutdown() {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
@@ -2674,17 +2779,56 @@ func (s *AppServer) Shutdown() {
 }
 
 func main() {
-	preferredPort := resolvePort()
-	listener, activePort := bindAvailableListener(preferredPort)
+	cliPort := flag.String("port", "", "Port to run CheckSpoof on (default 8085)")
+	integrationPeer := flag.String("integration-peer", "", "Run real two-server VPS integration test against this peer token and exit")
+	spoofIPFlag := flag.String("spoof-ip", "8.8.8.8", "Spoofed source IPv4 address for -integration-peer mode")
+	methodFlag := flag.String("method", "udp", "Test method for -integration-peer mode (udp or icmp)")
+	countFlag := flag.Int("count", 3, "Packet count for -integration-peer mode (1..10)")
+	flag.Parse()
 
 	srv, err := NewAppServer(&RealCommandRunner{})
 	if err != nil {
 		fmt.Printf("[-] Initialization error: %v\n", err)
 		os.Exit(1)
 	}
-	srv.Port = activePort
-
 	srv.CleanupAllChains()
+
+	// Real Two-Server VPS CLI Integration Test Mode
+	if strings.TrimSpace(*integrationPeer) != "" {
+		srv.Port = "8085"
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		defer cancel()
+		defer srv.CleanupAllChains()
+
+		fmt.Println("======================================================================")
+		fmt.Printf("🔬 Running Real Two-Server VPS Integration Test (%s)\n", strings.ToUpper(*methodFlag))
+		fmt.Printf("📍 Local Sender IP : %s\n", srv.ServerIP)
+		fmt.Printf("🎭 Spoof Source IP : %s\n", *spoofIPFlag)
+		fmt.Println("======================================================================")
+
+		res, runErr := srv.RunRealVPSIntegrationTest(ctx, *integrationPeer, *spoofIPFlag, *methodFlag, *countFlag)
+		if runErr != nil {
+			fmt.Printf("[-] Integration test execution failed: %v\n", runErr)
+			os.Exit(1)
+		}
+
+		fmt.Printf("1. Receiver Listener Ready : %v\n", res.ReceiverListenerReady)
+		fmt.Printf("2. SNAT Rule Installed     : %v (Chain: %s, Outgoing Iface: %s)\n", res.SNATRuleInstalled, res.IsolatedChainName, res.OutgoingInterface)
+		fmt.Printf("3. Local Packet Generation : %v (%d/%d packets sent)\n", res.LocalPacketGenSuccess, res.PacketsSent, res.PacketsAttempted)
+		fmt.Printf("4. Local SNAT Rule Matched : %d packets (%d bytes)\n", res.SNATPacketsMatched, res.SNATBytesMatched)
+		fmt.Printf("5. Remote Spoof Verified   : %v (%d verified packets with spoofed IP %s)\n", res.RemoteSpoofVerified, res.RemoteVerifiedCount, *spoofIPFlag)
+		fmt.Printf("🏁 Final Classification    : %s\n", res.PrimaryClassification)
+		fmt.Printf("📋 Evidence                : %s\n", res.ConfirmedEvidence)
+
+		if res.PrimaryClassification == ClassSpoofSuccess && res.RemoteSpoofVerified {
+			os.Exit(0)
+		}
+		os.Exit(2)
+	}
+
+	preferredPort := promptPortIfEmpty(*cliPort)
+	listener, activePort := bindAvailableListener(preferredPort)
+	srv.Port = activePort
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
