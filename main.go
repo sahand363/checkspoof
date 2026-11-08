@@ -234,12 +234,13 @@ func (p *PeerConfig) TargetIP() string {
 
 // PreparedSessionInfo holds Server A's record of a prepared receiver session on Server B.
 type PreparedSessionInfo struct {
-	SessionID        string `json:"session_id"`
-	Nonce            string `json:"nonce"`
-	ExpectedSourceIP string `json:"expected_source_ip"`
-	TestType         string `json:"test_type"`
-	UDPPort          int    `json:"udp_port"`
-	PacketCount      int    `json:"packet_count"`
+	SessionID        string    `json:"session_id"`
+	Nonce            string    `json:"nonce"`
+	ExpectedSourceIP string    `json:"expected_source_ip"`
+	TestType         string    `json:"test_type"`
+	UDPPort          int       `json:"udp_port"`
+	PacketCount      int       `json:"packet_count"`
+	PreparedAt       time.Time `json:"prepared_at"`
 }
 
 // CrashJournalEntry records a process-owned SNAT chain on disk so a subsequent startup
@@ -379,6 +380,15 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 		stopCh:             make(chan struct{}),
 	}
 	return s, nil
+}
+
+func (s *AppServer) activeSharedSecret() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Peer != nil && s.Peer.SharedSecret != "" {
+		return s.Peer.SharedSecret
+	}
+	return s.PairingSecret
 }
 
 func computeBehindNAT(localIP, publicIP string) bool {
@@ -1338,7 +1348,7 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 		req.MaxPackets = 5
 	}
 	if req.TimeoutSec <= 0 || req.TimeoutSec > 60 {
-		req.TimeoutSec = 30
+		req.TimeoutSec = 45
 	}
 	if req.SessionID == "" {
 		req.SessionID = randomHex(16)
@@ -1386,11 +1396,14 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 	s.LocalReceiverState = RecvInitializing
 	s.mu.Unlock()
 
+	var startupCompleted atomic.Bool
 	watchDone := make(chan struct{})
 	go func() {
 		select {
 		case <-callerCtx.Done():
-			sess.Cancel()
+			if !startupCompleted.Load() {
+				sess.Cancel()
+			}
 		case <-s.stopCh:
 			sess.Cancel()
 		case <-sess.DoneChan:
@@ -1437,6 +1450,7 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 			s.abortStartupSession(sess, RecvIdle, "cancelled during UDP listener startup")
 			return nil, errors.New("receiver session cancelled during UDP listener initialization")
 		}
+		startupCompleted.Store(true)
 		sess.State = RecvReady
 		sess.mu.Unlock()
 
@@ -1474,6 +1488,7 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 		s.abortStartupSession(sess, RecvIdle, "cancelled during ICMP listener startup")
 		return nil, errors.New("receiver session cancelled during ICMP listener initialization")
 	}
+	startupCompleted.Store(true)
 	sess.State = RecvReady
 	sess.mu.Unlock()
 
@@ -1551,6 +1566,44 @@ func (s *AppServer) CancelReceiverSession(sessionID string) bool {
 	return true
 }
 
+func (s *AppServer) validateUDPWithAnySecret(payload []byte, primarySecret string, sess *ReceiverSession) (int, error) {
+	seq, err := ValidateUDPPacketPayload(payload, primarySecret, sess.SessionID, sess.Nonce, sess.MaxPackets)
+	if err == nil {
+		return seq, nil
+	}
+	if primarySecret != s.PairingSecret {
+		if seq2, err2 := ValidateUDPPacketPayload(payload, s.PairingSecret, sess.SessionID, sess.Nonce, sess.MaxPackets); err2 == nil {
+			return seq2, nil
+		}
+	}
+	altSecret := s.activeSharedSecret()
+	if altSecret != primarySecret {
+		if seq3, err3 := ValidateUDPPacketPayload(payload, altSecret, sess.SessionID, sess.Nonce, sess.MaxPackets); err3 == nil {
+			return seq3, nil
+		}
+	}
+	return 0, err
+}
+
+func (s *AppServer) validateICMPWithAnySecret(rawPkt []byte, primarySecret string, sess *ReceiverSession) (int, uint16, uint16, error) {
+	seq, icmpID, icmpSeq, err := ValidateICMPRawPacket(rawPkt, primarySecret, sess.SessionID, sess.Nonce, sess.MaxPackets)
+	if err == nil {
+		return seq, icmpID, icmpSeq, nil
+	}
+	if primarySecret != s.PairingSecret {
+		if seq2, id2, iSeq2, err2 := ValidateICMPRawPacket(rawPkt, s.PairingSecret, sess.SessionID, sess.Nonce, sess.MaxPackets); err2 == nil {
+			return seq2, id2, iSeq2, nil
+		}
+	}
+	altSecret := s.activeSharedSecret()
+	if altSecret != primarySecret {
+		if seq3, id3, iSeq3, err3 := ValidateICMPRawPacket(rawPkt, altSecret, sess.SessionID, sess.Nonce, sess.MaxPackets); err3 == nil {
+			return seq3, id3, iSeq3, nil
+		}
+	}
+	return 0, 0, 0, err
+}
+
 func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn net.PacketConn, sess *ReceiverSession, secret string) {
 	var closeOnce sync.Once
 	closeConn := func() {
@@ -1602,7 +1655,7 @@ func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn net.PacketConn,
 		if n <= 0 || sourceIP != sess.ExpectedSourceIP {
 			continue
 		}
-		seq, valErr := ValidateUDPPacketPayload(buf[:n], secret, sess.SessionID, sess.Nonce, sess.MaxPackets)
+		seq, valErr := s.validateUDPWithAnySecret(buf[:n], secret, sess)
 		sess.mu.Lock()
 		if valErr != nil {
 			sess.InvalidPackets++
@@ -1682,7 +1735,7 @@ func (s *AppServer) runICMPReceiverLoop(ctx context.Context, conn net.PacketConn
 		if n <= 0 || sourceIP != sess.ExpectedSourceIP {
 			continue
 		}
-		seq, icmpID, icmpSeq, valErr := ValidateICMPRawPacket(buf[:n], secret, sess.SessionID, sess.Nonce, sess.MaxPackets)
+		seq, icmpID, icmpSeq, valErr := s.validateICMPWithAnySecret(buf[:n], secret, sess)
 		if valErr != nil {
 			continue
 		}
@@ -1813,12 +1866,17 @@ func (s *AppServer) performHeartbeatTick() {
 	s.MissedHeartbeats = 0
 	s.ConnState = ConnConnected
 	s.LastHeartbeat = time.Now()
-	s.PeerReceiverState = respPayload.ReceiverState
 
-	if s.PreparedSession != nil {
-		if respPayload.ActiveSessionID != s.PreparedSession.SessionID ||
-			(respPayload.ReceiverState != RecvReady && respPayload.ReceiverState != RecvRunning) {
-			s.PreparedSession = nil
+	// Do not allow an in-flight heartbeat response to clobber a freshly prepared session (< 3s old).
+	if s.PreparedSession != nil && time.Since(s.PreparedSession.PreparedAt) < 3*time.Second && respPayload.ReceiverState == RecvIdle {
+		// Keep s.PeerReceiverState = RecvReady
+	} else {
+		s.PeerReceiverState = respPayload.ReceiverState
+		if s.PreparedSession != nil {
+			if (respPayload.ActiveSessionID != "" && respPayload.ActiveSessionID != s.PreparedSession.SessionID) ||
+				(respPayload.ReceiverState != RecvReady && respPayload.ReceiverState != RecvRunning) {
+				s.PreparedSession = nil
+			}
 		}
 	}
 
@@ -2017,7 +2075,11 @@ func (s *AppServer) handlePeerHeartbeat(w http.ResponseWriter, r *http.Request) 
 		s.ConnState = ConnConnected
 		s.LastHeartbeat = time.Now()
 		s.MissedHeartbeats = 0
-		s.PeerReceiverState = req.ReceiverState
+		if s.PreparedSession != nil && time.Since(s.PreparedSession.PreparedAt) < 3*time.Second && req.ReceiverState == RecvIdle {
+			// Ignore stale in-flight heartbeat arriving right after session preparation
+		} else {
+			s.PeerReceiverState = req.ReceiverState
+		}
 		if IsPublicRoutableIPv4(req.PublicIP) {
 			s.Peer.PublicIP = req.PublicIP
 		}
@@ -2054,7 +2116,8 @@ func (s *AppServer) handlePeerPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.StartReceiverSessionWithContext(r.Context(), req, s.PairingSecret)
+	// Pass context.Background() so completion of the HTTP request never cancels the newly opened listener!
+	resp, err := s.StartReceiverSessionWithContext(context.Background(), req, s.activeSharedSecret())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2332,6 +2395,7 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 		TestType:         req.TestType,
 		UDPPort:          5555,
 		PacketCount:      req.PacketCount,
+		PreparedAt:       time.Now(),
 	}
 	s.mu.Unlock()
 
@@ -2748,6 +2812,7 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 		TestType:         testMethod,
 		UDPPort:          5555,
 		PacketCount:      packetCount,
+		PreparedAt:       time.Now(),
 	}
 
 	result := s.executeCoordinatedTest(ctx, peerCfg, prepInfo)
