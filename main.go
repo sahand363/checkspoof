@@ -243,8 +243,7 @@ type PreparedSessionInfo struct {
 }
 
 // CrashJournalEntry records a process-owned SNAT chain on disk so a subsequent startup
-// can clean up chains orphaned by a hard crash (SIGKILL/power loss) of a dead PID
-// without ever touching chains belonging to live CheckSpoof processes.
+// can clean up chains orphaned by a hard crash of a dead PID without touching live processes.
 type CrashJournalEntry struct {
 	PID          int      `json:"pid"`
 	InstanceID   string   `json:"instance_id"`
@@ -315,8 +314,6 @@ func NewAppServer(runner CommandRunner) (*AppServer, error) {
 	pairSecret := randomHex(16)
 	adminKey := randomHex(12)
 
-	// Detect local outbound interface and local source IP via `ip route get`.
-	// Never assume this local address is the server's public IP.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	localRoute, routeErr := DetectLocalOutboundRoute(ctx, runner, "8.8.8.8")
 	cancel()
@@ -397,7 +394,6 @@ func computeBehindNAT(localIP, publicIP string) bool {
 	return false
 }
 
-// EffectiveControlIP returns the best known control IPv4 address for pairing/listening.
 func (s *AppServer) EffectiveControlIP() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -417,7 +413,6 @@ func (s *AppServer) effectiveControlIPLocked() string {
 	return IPValueUnknown
 }
 
-// SetManualPublicIP configures an explicit public IPv4 address.
 func (s *AppServer) SetManualPublicIP(ipStr string) error {
 	ipStr = strings.TrimSpace(ipStr)
 	if ipStr == "" || strings.EqualFold(ipStr, IPValueUnknown) {
@@ -463,7 +458,6 @@ func (s *AppServer) SetManualPublicIP(ipStr string) error {
 	return nil
 }
 
-// DiscoverAndSetPublicIP queries external public IP discovery endpoints.
 func (s *AppServer) DiscoverAndSetPublicIP(ctx context.Context) (string, error) {
 	s.mu.RLock()
 	if s.PublicIPSource == PublicIPManual && isValidIPv4(s.PublicIP) {
@@ -506,7 +500,6 @@ func (s *AppServer) DiscoverAndSetPublicIP(ctx context.Context) (string, error) 
 	return discovered, nil
 }
 
-// DiscoverPublicIP queries one or more HTTP endpoints for the server's public IPv4 address.
 func DiscoverPublicIP(ctx context.Context, client *http.Client, endpoints []string) (string, error) {
 	if len(endpoints) == 0 {
 		return IPValueUnknown, errors.New("no public IP discovery endpoints configured")
@@ -902,8 +895,6 @@ func ValidateICMPRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNon
 
 // Process/Session-Scoped Isolated iptables SNAT Chain Lifecycle Management
 
-// SNATChainIsolation tracks the exact firewall resources created by a single test session
-// so cleanup removes ONLY resources owned by that session and safely rolls back partial state.
 type SNATChainIsolation struct {
 	ChainName    string
 	InstanceID   string
@@ -932,8 +923,6 @@ func sanitizeAlphaNumUpper(s string, maxLen int) string {
 	return b.String()
 }
 
-// BuildSNATChainName generates a process- and session-scoped iptables chain name:
-// Format: CSPF_<6CharInstanceID>_<8CharSessionTag> (max 20 chars, well under Linux's 28-char limit).
 func (s *AppServer) BuildSNATChainName(sessionID string) string {
 	inst := sanitizeAlphaNumUpper(s.InstanceChainID, 6)
 	if len(inst) < 6 {
@@ -958,8 +947,6 @@ func (s *AppServer) allocateUniqueChainName(sessionID string) string {
 	if _, exists := s.OwnedChains[base]; !exists {
 		return base
 	}
-	// If the caller passed a duplicate sessionID while a chain with that ID is still active,
-	// disambiguate using the monotonic per-instance chain sequence so we never clobber an active session.
 	inst := sanitizeAlphaNumUpper(s.InstanceChainID, 6)
 	for {
 		seq := atomic.AddUint64(&s.chainSeq, 1)
@@ -970,8 +957,6 @@ func (s *AppServer) allocateUniqueChainName(sessionID string) string {
 	}
 }
 
-// SetupIsolatedSNATChain creates a uniquely identifiable per-process/per-session NAT chain,
-// tracks each initialization step for safe partial-failure rollback, and records ownership.
 func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, sessionID, iface, targetIP, spoofIP, proto string, udpPort int) (*SNATChainIsolation, error) {
 	chainName := s.allocateUniqueChainName(sessionID)
 
@@ -996,14 +981,10 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, sessionID, iface
 		Server:     s,
 	}
 
-	// Register ownership in s.OwnedChains before executing iptables commands so concurrent
-	// Shutdown/CleanupAllChains calls are aware of in-progress or active chains.
 	s.chainsMu.Lock()
 	s.OwnedChains[chainName] = iso
 	s.chainsMu.Unlock()
 
-	// Step 1: Create dedicated chain (-N). Never pre-flush or pre-delete before -N,
-	// so we can never accidentally destroy an existing chain.
 	if out, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-N", chainName); err != nil {
 		s.chainsMu.Lock()
 		delete(s.OwnedChains, chainName)
@@ -1016,7 +997,6 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, sessionID, iface
 	iso.mu.Unlock()
 	s.syncCrashJournal()
 
-	// Step 2: Insert SNAT rule inside our newly created chain (-A).
 	if out, _, err := s.Runner.Run(ctx, "iptables", ruleArgs...); err != nil {
 		iso.Cleanup()
 		return nil, fmt.Errorf("failed to insert SNAT rule into %s: %v (%s)", chainName, err, strings.TrimSpace(string(out)))
@@ -1027,14 +1007,12 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, sessionID, iface
 	iso.mu.Unlock()
 	s.syncCrashJournal()
 
-	// Step 3: Verify rule creation and target SNAT address inside our dedicated chain.
 	verifyOut, _, err := s.Runner.Run(ctx, "iptables", "-t", "nat", "-L", chainName, "-v", "-n", "-x")
 	if err != nil || !strings.Contains(string(verifyOut), "to:"+spoofIP) {
 		iso.Cleanup()
 		return nil, fmt.Errorf("failed to verify SNAT rule in chain %s", chainName)
 	}
 
-	// Step 4: Hook chain into POSTROUTING (-I POSTROUTING 1).
 	insertArgs := append([]string{"-t", "nat", "-I", "POSTROUTING", "1"}, jumpSpec...)
 	if out, _, err := s.Runner.Run(ctx, "iptables", insertArgs...); err != nil {
 		iso.Cleanup()
@@ -1049,7 +1027,6 @@ func (s *AppServer) SetupIsolatedSNATChain(ctx context.Context, sessionID, iface
 	return iso, nil
 }
 
-// ReadCounters reads exact packet and byte counters exclusively from the session's isolated chain.
 func (c *SNATChainIsolation) ReadCounters(ctx context.Context) (packets int, bytesCount int, rawOutput string, err error) {
 	out, _, err := c.Runner.Run(ctx, "iptables", "-t", "nat", "-L", c.ChainName, "-v", "-n", "-x")
 	rawOutput = string(out)
@@ -1081,8 +1058,6 @@ func ParseIsolatedChainCounters(output string) (int, int, error) {
 	return 0, 0, errors.New("SNAT rule counter line not found in isolated chain output")
 }
 
-// Cleanup safely, idempotently, and concurrency-safely removes ONLY the firewall resources
-// created by this specific SNATChainIsolation session.
 func (c *SNATChainIsolation) Cleanup() {
 	c.mu.Lock()
 	if c.cleaned {
@@ -1099,13 +1074,11 @@ func (c *SNATChainIsolation) Cleanup() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Remove POSTROUTING jump rule ONLY if it was actually inserted by this session.
 	if jumpInserted && len(jumpArgs) > 0 {
 		delArgs := append([]string{"-t", "nat", "-D", "POSTROUTING"}, jumpArgs...)
 		_, _, _ = c.Runner.Run(ctx, "iptables", delArgs...)
 	}
 
-	// Flush and delete the isolated chain ONLY if it was actually created by this session.
 	if chainCreated && chainName != "" {
 		_, _, _ = c.Runner.Run(ctx, "iptables", "-t", "nat", "-F", chainName)
 		_, _, _ = c.Runner.Run(ctx, "iptables", "-t", "nat", "-X", chainName)
@@ -1119,8 +1092,6 @@ func (c *SNATChainIsolation) Cleanup() {
 	}
 }
 
-// CleanupAllChains cleans up ONLY the SNAT chains and rules owned by this AppServer instance.
-// It never sweeps or deletes chains belonging to other CheckSpoof processes or unrelated firewall rules.
 func (s *AppServer) CleanupAllChains() {
 	s.chainsMu.Lock()
 	owned := make([]*SNATChainIsolation, 0, len(s.OwnedChains))
@@ -1180,7 +1151,6 @@ func (s *AppServer) syncCrashJournal() {
 		_ = json.Unmarshal(data, &existing)
 	}
 
-	// Preserve entries from other AppServer instances; replace only this instance's entries.
 	merged := make([]CrashJournalEntry, 0, len(existing)+len(myEntries))
 	for _, e := range existing {
 		if e.InstanceID != s.InstanceChainID {
@@ -1198,8 +1168,6 @@ func (s *AppServer) syncCrashJournal() {
 	}
 }
 
-// RecoverOrphanedChainsFromJournal inspects the crash journal and cleans up ONLY chains
-// whose owning process PID is no longer alive. Chains belonging to live processes are untouched.
 func (s *AppServer) RecoverOrphanedChainsFromJournal(ctx context.Context) int {
 	if s.JournalPath == "" {
 		return 0
@@ -1479,7 +1447,7 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 		}
 		s.mu.Unlock()
 
-		s.AddLog(fmt.Sprintf("🟢 [Receiver] READY_TO_RECEIVE on UDP %s (Session=%s, ExpectSource=%s)", actualAddr, req.SessionID[:8], req.ExpectedSourceIP))
+		s.AddLog(fmt.Sprintf("🟢 [Receiver] READY! Listening on UDP %s for spoofed IP %s (این سرور آماده دریافت پکت است)", actualAddr, req.ExpectedSourceIP))
 		go s.runUDPReceiverLoop(sessCtx, conn, sess, sharedSecret)
 
 		return &PeerPrepareResponse{
@@ -1515,7 +1483,7 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 	}
 	s.mu.Unlock()
 
-	s.AddLog(fmt.Sprintf("🟢 [Receiver] READY_TO_RECEIVE on ip4:icmp (Session=%s, ExpectSource=%s)", req.SessionID[:8], req.ExpectedSourceIP))
+	s.AddLog(fmt.Sprintf("🟢 [Receiver] READY! Listening on ip4:icmp for spoofed IP %s (این سرور آماده دریافت پکت است)", req.ExpectedSourceIP))
 	go s.runICMPReceiverLoop(sessCtx, conn, sess, sharedSecret)
 
 	return &PeerPrepareResponse{
@@ -2367,7 +2335,7 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	s.AddLog(fmt.Sprintf("🟢 [Handshake] Receiver confirmed READY_TO_RECEIVE on %s (Session=%s)", prepResp.BoundAddress, sessionID[:8]))
+	s.AddLog(fmt.Sprintf("🟢 [Sender] This server is ready to send packets! (سرور دوم روی %s در حال گوش دادن است — این سرور آماده ارسال پکت است)", prepResp.BoundAddress))
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2422,7 +2390,7 @@ func (s *AppServer) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	prep := s.PreparedSession
 	if peer == nil || connState != ConnConnected || prep == nil || s.PeerReceiverState != RecvReady {
 		s.mu.Unlock()
-		http.Error(w, "گیرنده در وضعیت READY_TO_RECEIVE نیست. ابتدا دکمه «آماده‌سازی گیرنده» را بزنید.", http.StatusPreconditionFailed)
+		http.Error(w, "گیرنده در وضعیت READY_TO_RECEIVE نیست. ابتدا دکمه «۱. سرور دوم گوش بدهد» را بزنید.", http.StatusPreconditionFailed)
 		return
 	}
 	s.ActiveTestRunning = true
@@ -2934,7 +2902,7 @@ const dashboardHTML = `<!DOCTYPE html>
             padding: 7px 12px; border-radius: 10px; border: 1px solid var(--border);
             direction: ltr; flex: 1; max-width: 650px; justify-content: space-between;
         }
-        .token-value-wrap code { color: #4ade80; font-family: monospace; font-size: 12px; word-break: break-all; }
+        .token-value-wrap code { color: #4ade80; font-family: monospace; font-size: 12px; word-break: break-all; user-select: all; }
         .btn-sm {
             background: #1e293b; color: #f8fafc; border: 1px solid #334155; padding: 5px 10px;
             border-radius: 6px; font-family: inherit; font-size: 11.5px; cursor: pointer; white-space: nowrap;
@@ -2962,14 +2930,14 @@ const dashboardHTML = `<!DOCTYPE html>
             background: var(--emerald-grad); color: #fff; border: none; padding: 0 16px;
             border-radius: 9px; font-family: inherit; font-size: 12.5px; font-weight: 700; cursor: pointer; white-space: nowrap;
         }
-        .action-row { display: grid; grid-template-columns: 1fr 1.2fr; gap: 10px; margin-top: 4px; }
+        .action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }
         .btn-prepare {
             background: var(--amber-grad); color: #fff; border: none; padding: 13px 14px;
-            border-radius: 10px; font-family: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer;
+            border-radius: 10px; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
         }
         .btn-primary {
             background: var(--primary-grad); color: #fff; border: none; padding: 13px 14px;
-            border-radius: 10px; font-family: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer;
+            border-radius: 10px; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
         }
         .btn-prepare:disabled, .btn-primary:disabled {
             background: #1e293b; color: #64748b; cursor: not-allowed; border: 1px solid #334155;
@@ -3010,19 +2978,19 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="pill"><span>IP محلی ({{.Iface}}):</span><strong id="local_ip_badge">{{.LocalOutboundIP}}</strong></div>
                 <div class="pill"><span>IP عمومی:</span><strong id="public_ip_badge">{{.PublicIP}} ({{.PublicIPSource}})</strong></div>
                 <div class="pill"><span>وضعیت اتصال:</span><strong id="conn_state_badge">DISCONNECTED</strong></div>
-                <div class="pill"><span>آمادگی گیرنده:</span><strong id="recv_state_badge">IDLE</strong></div>
+                <div class="pill"><span>وضعیت سرور دوم:</span><strong id="recv_state_badge">IDLE</strong></div>
                 <div class="pill"><span>آخرین ضربان:</span><strong id="hb_badge">—</strong></div>
             </div>
         </header>
 
         <div class="token-banner">
             <div style="font-size: 12.5px;">
-                🔑 <strong>توکن جفت‌سازی امن این سرور (حاوی اثرانگشت گواهی TLS):</strong>
+                🔑 <strong>توکن جفت‌سازی امن این سرور (کپی کرده و در سرور مقابل وارد کنید):</strong>
             </div>
             <div class="token-value-wrap">
-                <code id="my_token" data-token="{{.PairingToken}}">••••••••••••••••••••••••••••••••••••••••••••••••••••</code>
+                <code id="my_token" data-token="{{.PairingToken}}">{{.PairingToken}}</code>
                 <div style="display:flex; gap:6px;">
-                    <button class="btn-sm" onclick="toggleToken()" id="toggle_btn">نمایش</button>
+                    <button class="btn-sm" onclick="toggleToken()" id="toggle_btn">مخفی کردن</button>
                     <button class="btn-sm" onclick="copyToken()" id="copy_btn">کپی توکن</button>
                 </div>
             </div>
@@ -3031,7 +2999,7 @@ const dashboardHTML = `<!DOCTYPE html>
         <div class="dashboard-grid">
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">⚙️ ۱. تنظیمات شبکه، جفت‌سازی TLS 1.3 و آماده‌سازی گیرنده</h2>
+                    <h2 class="card-title">⚙️ ۱. تنظیمات شبکه، اتصال TLS 1.3 و ارسال پکت</h2>
                 </div>
 
                 <div class="form-group">
@@ -3045,8 +3013,8 @@ const dashboardHTML = `<!DOCTYPE html>
                 <div class="form-group">
                     <label>🔗 توکن سرور دوم (گیرنده):</label>
                     <div class="connect-group">
-                        <input type="password" id="remote_token" class="ltr-input" placeholder="IP:PORT|SERVER_ID|CERT_FP|SECRET">
-                        <button class="btn-connect" onclick="pairServer()" id="pair_btn">اتصال و احراز هویت TLS</button>
+                        <input type="text" id="remote_token" class="ltr-input" placeholder="IP:PORT|SERVER_ID|CERT_FP|SECRET">
+                        <button class="btn-connect" onclick="pairServer()" id="pair_btn">اتصال به سرور دوم</button>
                     </div>
                     <div id="pair_alert" class="alert-box"></div>
                 </div>
@@ -3055,7 +3023,7 @@ const dashboardHTML = `<!DOCTYPE html>
                     <div class="form-group">
                         <label>🛠️ متد تست پروتکل:</label>
                         <select id="test_type" onchange="invalidatePrepare()">
-                            <option value="icmp">Method 1 — ICMP SNAT (امضای رمزنگاری در پکت)</option>
+                            <option value="icmp">Method 1 — ICMP SNAT (پینگ با امضای رمزنگاری)</option>
                             <option value="udp">Method 2 — UDP SNAT (فریم رمزنگاری CSPFv2)</option>
                             <option value="raw" disabled>Method 3 — Raw IP Header (NOT IMPLEMENTED)</option>
                         </select>
@@ -3068,7 +3036,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
                 <div class="form-row">
                     <div class="form-group">
-                        <label>🎯 سرور مقصد (فقط سرور جفت‌شده مجاز است):</label>
+                        <label>🎯 سرور مقصد (گیرنده):</label>
                         <input type="text" id="target_ip" class="ltr-input" readonly placeholder="پس از اتصال خودکار پر می‌شود">
                     </div>
                     <div class="form-group">
@@ -3085,10 +3053,10 @@ const dashboardHTML = `<!DOCTYPE html>
 
                 <div class="action-row">
                     <button id="prep_btn" class="btn-prepare" disabled onclick="prepareReceiver()">
-                        ۱. آماده‌سازی شنونده گیرنده
+                        📡 ۱. سرور دوم گوش بدهد (Listen)
                     </button>
                     <button id="run_btn" class="btn-primary" disabled onclick="runTest()">
-                        ۲. شروع تست و ارزیابی
+                        🚀 ۲. ارسال پکت‌های تست (Send)
                     </button>
                 </div>
 
@@ -3097,8 +3065,13 @@ const dashboardHTML = `<!DOCTYPE html>
 
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">📊 ۲. مراحل تفکیک‌شده اعتبارسنجی</h2>
-                    <span id="local_recv_badge" style="font-size:11.5px; color:var(--text-muted); font-family:monospace;">Local Receiver: IDLE</span>
+                    <h2 class="card-title">📊 ۲. وضعیت گیرنده و پنجره لاگ زنده</h2>
+                    <span id="local_recv_badge" style="font-size:12px; font-weight:bold; color:var(--text-muted); font-family:monospace;">Local Receiver: IDLE</span>
+                </div>
+
+                <div id="receiver_ready_banner" class="alert-box success">
+                    <strong>🟢 READY — این سرور در حال گوش دادن (Listening) است!</strong>
+                    آماده دریافت پکت‌های تست از سرور مقابل می‌باشد.
                 </div>
 
                 <div class="metrics-grid">
@@ -3122,7 +3095,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
                 <div class="terminal-window">
                     <div class="terminal-bar">
-                        <span style="font-size: 11px; color: #64748b; font-family: monospace;">root@checkspoof:~# audit-log</span>
+                        <span style="font-size: 11px; color: #64748b; font-family: monospace;">root@checkspoof:~# live-log</span>
                         <button class="btn-sm" onclick="clearLogs()">پاکسازی لاگ</button>
                     </div>
                     <div id="terminal">System initialized. Waiting for pairing...</div>
@@ -3133,7 +3106,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
     <script>
         const ADMIN_KEY = "{{.AdminKey}}";
-        let tokenVisible = false;
+        let tokenVisible = true;
 
         function apiHeaders() {
             return {
@@ -3150,12 +3123,58 @@ const dashboardHTML = `<!DOCTYPE html>
             btn.innerText = tokenVisible ? 'مخفی کردن' : 'نمایش';
         }
 
+        function copyTextFallback(text) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.top = '-9999px';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            ta.setSelectionRange(0, text.length);
+            let ok = false;
+            try {
+                ok = document.execCommand('copy');
+            } catch (e) {
+                ok = false;
+            }
+            document.body.removeChild(ta);
+            return ok;
+        }
+
         function copyToken() {
-            const raw = document.getElementById('my_token').getAttribute('data-token');
-            navigator.clipboard.writeText(raw);
+            const el = document.getElementById('my_token');
+            const raw = el.getAttribute('data-token');
             const btn = document.getElementById('copy_btn');
-            btn.innerText = 'کپی شد ✓';
-            setTimeout(() => { btn.innerText = 'کپی توکن'; }, 2000);
+
+            const markCopied = () => {
+                btn.innerText = 'کپی شد ✓';
+                btn.style.borderColor = '#22c55e';
+                btn.style.color = '#4ade80';
+                setTimeout(() => {
+                    btn.innerText = 'کپی توکن';
+                    btn.style.borderColor = '#334155';
+                    btn.style.color = '#f8fafc';
+                }, 2000);
+            };
+
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(raw).then(markCopied).catch(() => {
+                    if (copyTextFallback(raw)) {
+                        markCopied();
+                    } else {
+                        window.prompt('توکن را با Ctrl+C کپی کنید:', raw);
+                    }
+                });
+            } else {
+                if (copyTextFallback(raw)) {
+                    markCopied();
+                } else {
+                    window.prompt('توکن را با Ctrl+C کپی کنید:', raw);
+                }
+            }
         }
 
         function savePublicIP() {
@@ -3197,11 +3216,23 @@ const dashboardHTML = `<!DOCTYPE html>
             .then(r => r.json())
             .then(d => {
                 document.getElementById('conn_state_badge').innerText = d.conn_state;
-                document.getElementById('recv_state_badge').innerText = d.peer_receiver_state;
+                const peerLabel = (d.peer_receiver_state === "READY_TO_RECEIVE") ? "🟢 READY (در حال گوش دادن)" : d.peer_receiver_state;
+                document.getElementById('recv_state_badge').innerText = peerLabel;
                 document.getElementById('hb_badge').innerText = d.last_heartbeat;
                 document.getElementById('local_ip_badge').innerText = d.local_outbound_ip;
                 document.getElementById('public_ip_badge').innerText = d.public_ip + " (" + d.public_ip_source + ")";
-                document.getElementById('local_recv_badge').innerText = "Local Receiver: " + d.local_receiver_state;
+
+                const localBadge = document.getElementById('local_recv_badge');
+                const readyBanner = document.getElementById('receiver_ready_banner');
+                if (d.local_receiver_state === "READY_TO_RECEIVE" || d.local_receiver_state === "TEST_RUNNING") {
+                    localBadge.innerText = "🟢 READY (در حال گوش دادن)";
+                    localBadge.style.color = "#4ade80";
+                    readyBanner.className = "alert-box success show";
+                } else {
+                    localBadge.innerText = "Local Receiver: " + d.local_receiver_state;
+                    localBadge.style.color = "#94a3b8";
+                    readyBanner.className = "alert-box success";
+                }
 
                 if (d.peer_ip && d.peer_ip !== "—") {
                     document.getElementById('target_ip').value = d.peer_ip;
@@ -3231,7 +3262,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
             btn.disabled = true;
             alertBox.className = 'alert-box warning show';
-            alertBox.innerHTML = '<strong>⏳ در حال احراز هویت متقابل TLS 1.3...</strong>';
+            alertBox.innerHTML = '<strong>⏳ در حال اتصال امن TLS 1.3 به سرور دوم...</strong>';
 
             fetch('/api/admin/pair', {
                 method: 'POST',
@@ -3246,11 +3277,11 @@ const dashboardHTML = `<!DOCTYPE html>
                 document.getElementById('target_ip').value = d.peer_ip;
                 document.getElementById('prep_btn').disabled = false;
                 alertBox.className = 'alert-box success show';
-                alertBox.innerHTML = '<strong>✅ اتصال امن TLS 1.3 برقرار شد!</strong>شناسه سرور مقابل: <code>' + d.peer_server_id + '</code> | آدرس مقصد: <code>' + d.peer_ip + '</code> (IP عمومی: <code>' + d.peer_public_ip + '</code>). اکنون دکمه «۱. آماده‌سازی شنونده گیرنده» را بزنید.';
+                alertBox.innerHTML = '<strong>✅ اتصال برقرار شد!</strong>سرور دوم (<code>' + d.peer_ip + '</code>) متصل است. اکنون دکمه <b>«📡 ۱. سرور دوم گوش بدهد (Listen)»</b> را بزنید.';
             })
             .catch(err => {
                 alertBox.className = 'alert-box failure show';
-                alertBox.innerHTML = '<strong>❌ خطا در جفت‌سازی</strong>' + err.message;
+                alertBox.innerHTML = '<strong>❌ خطا در اتصال</strong>' + err.message;
             })
             .finally(() => {
                 btn.disabled = false;
@@ -3266,7 +3297,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
             prepBtn.disabled = true;
             resBox.className = 'alert-box warning show';
-            resBox.innerHTML = '<strong>⏳ در حال راه‌اندازی سوکت شنونده روی سرور دوم...</strong>';
+            resBox.innerHTML = '<strong>⏳ در حال قرار دادن سرور دوم در حالت گوش دادن (Listen)...</strong>';
 
             fetch('/api/admin/prepare', {
                 method: 'POST',
@@ -3280,11 +3311,11 @@ const dashboardHTML = `<!DOCTYPE html>
             .then(d => {
                 document.getElementById('run_btn').disabled = false;
                 resBox.className = 'alert-box success show';
-                resBox.innerHTML = '<strong>🟢 گیرنده آماده دریافت پکت است (READY_TO_RECEIVE)</strong>سوکت <code>' + d.bound_address + '</code> برای نشست <code>' + d.session_id.substring(0, 8) + '</code> باز شد. اکنون دکمه «۲. شروع تست و ارزیابی» را بزنید.';
+                resBox.innerHTML = '<strong>🟢 سرور دوم هم‌اکنون در حال گوش دادن است (READY) و این سرور آماده ارسال پکت است!</strong>اکنون دکمه <b>«🚀 ۲. ارسال پکت‌های تست (Send)»</b> را بزنید.';
             })
             .catch(err => {
                 resBox.className = 'alert-box failure show';
-                resBox.innerHTML = '<strong>❌ خطا در آماده‌سازی گیرنده</strong>' + err.message;
+                resBox.innerHTML = '<strong>❌ خطا در فعال‌سازی گیرنده</strong>' + err.message;
             })
             .finally(() => {
                 prepBtn.disabled = false;
@@ -3296,7 +3327,7 @@ const dashboardHTML = `<!DOCTYPE html>
             const resBox = document.getElementById('test_result_box');
             runBtn.disabled = true;
             resBox.className = 'alert-box warning show';
-            resBox.innerHTML = '<strong>🚀 در حال اجرای تست ایزوله و اعتبارسنجی رمزنگاری پکت‌ها...</strong>';
+            resBox.innerHTML = '<strong>🚀 در حال ارسال پکت‌های اسپوف‌شده به سرور دوم...</strong>';
 
             fetch('/api/admin/test', {
                 method: 'POST',
@@ -3599,7 +3630,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Recover only chains orphaned by dead crashed PIDs; never touch active processes' chains.
 	recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = srv.RecoverOrphanedChainsFromJournal(recCtx)
 	recCancel()
@@ -3615,7 +3645,6 @@ func main() {
 		discCancel()
 	}
 
-	// Real Two-Server VPS CLI Integration Test Mode
 	if strings.TrimSpace(*integrationPeer) != "" {
 		srv.Port = "8085"
 		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
