@@ -591,6 +591,7 @@ func TestLocalControlFlowAndPacketFraming_LoopbackMocked_DoesNotClaimSpoofSucces
 		"spoof_ip":     "127.0.0.1",
 		"test_type":    "udp",
 		"packet_count": 3,
+		"udp_port":     findFreeUDPPort(t),
 	})
 	reqPrep, _ := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+portA+"/api/admin/prepare", bytes.NewReader(prepBody))
 	reqPrep.Header.Set("X-Admin-Key", srvA.AdminKey)
@@ -632,6 +633,45 @@ func TestLocalControlFlowAndPacketFraming_LoopbackMocked_DoesNotClaimSpoofSucces
 	if testRes.PrimaryClassification != ClassSimulatedControlVerified || !testRes.IsLoopbackOrSimulated {
 		t.Fatalf("expected SIMULATED_CONTROL_FLOW_VERIFIED with IsLoopbackOrSimulated=true, got %s (isLoopback=%v)",
 			testRes.PrimaryClassification, testRes.IsLoopbackOrSimulated)
+	}
+	if testRes.ControlPacketsSent != 3 || testRes.ControlReceivedCount != 3 {
+		t.Fatalf("expected 3/3 control packets to reach the receiver, got sent=%d received=%d",
+			testRes.ControlPacketsSent, testRes.ControlReceivedCount)
+	}
+}
+
+// Control (baseline) frames and spoofed test frames must never validate as each other.
+func TestControlFramesAreDistinctFromSpoofFrames(t *testing.T) {
+	secret, sess, nonce := "secretsecretsecret", randomHex(16), randomHex(16)
+	now := time.Now().UnixMilli()
+
+	ctl := BuildUDPControlPayload(secret, sess, nonce, 1, now)
+	if _, err := ValidateUDPControlPayload(ctl, secret, sess, nonce, 3); err != nil {
+		t.Fatalf("control frame should validate as control: %v", err)
+	}
+	if _, err := ValidateUDPPacketPayload(ctl, secret, sess, nonce, 3); err == nil {
+		t.Fatal("control frame must not validate as a spoofed test frame")
+	}
+	spoof := BuildUDPPacketPayload(secret, sess, nonce, 1, now)
+	if _, err := ValidateUDPControlPayload(spoof, secret, sess, nonce, 3); err == nil {
+		t.Fatal("spoofed test frame must not validate as a control frame")
+	}
+
+	mkICMP := func(patHex string) []byte {
+		pat, _ := hex.DecodeString(patHex)
+		pkt := make([]byte, 8+48)
+		pkt[0] = 8
+		for i := 16; i < 48; i++ {
+			pkt[8+i] = pat[(i)%len(pat)]
+		}
+		return pkt
+	}
+	ctlHex, _ := BuildICMPControlPatternHex(secret, sess, nonce, 2)
+	if seq, _, _, err := ValidateICMPControlRawPacket(mkICMP(ctlHex), secret, sess, nonce, 3); err != nil || seq != 2 {
+		t.Fatalf("ICMP control frame should validate (seq=%d err=%v)", seq, err)
+	}
+	if _, _, _, err := ValidateICMPRawPacket(mkICMP(ctlHex), secret, sess, nonce, 3); err == nil {
+		t.Fatal("ICMP control frame must not validate as a spoofed test frame")
 	}
 }
 
@@ -898,7 +938,7 @@ func TestRealTwoServerVPSIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
-	res, err := srv.RunRealVPSIntegrationTest(ctx, peerToken, spoofIP, method, 3)
+	res, err := srv.RunRealVPSIntegrationTest(ctx, peerToken, spoofIP, method, 3, 0)
 	if err != nil {
 		t.Fatalf("real two-VPS integration test failed: %v", err)
 	}

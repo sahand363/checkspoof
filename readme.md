@@ -9,7 +9,7 @@
 این دستور را با دسترسی `root` روی **هر دو سرور لینوکسی** (Ubuntu/Debian) اجرا کنید:
 
 ```bash
-sudo curl -sSL https://raw.githubusercontent.com/sahand363/checkspoof/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/sahand363/checkspoof/main/install.sh | sudo bash
 ```
 
 ### نصب مستقیم فایل اجرایی
@@ -31,6 +31,8 @@ sudo checkspoof -port 8085
 ```
 
 (اگر سرور پشت NAT یا در یک Cloud VPC قرار دارد، می‌توانید آدرس IP عمومی آن را نیز مشخص کنید: `-public-ip <YOUR_PUBLIC_IP>`)
+
+> **مهم:** برای تست UDP، پورت UDP گیرنده (پیش‌فرض `5555`، قابل تغییر در داشبورد یا با `-udp-port`) باید در فایروال سرور B و فایروال ابری (Security Group) باز باشد.
 
 لینک ورود به داشبورد را که در خروجی ترمینال نمایش داده می‌شود، در مرورگر باز کنید.
 
@@ -81,7 +83,7 @@ sudo checkspoof -port 8085
 نمونه دستور:
 
 ```bash
-sudo checkspoof -integration-peer "SERVER_B_IP:8085|SERVER_ID|CERT_FP|SECRET" -spoof-ip 8.8.8.8 -method udp -count 3
+sudo checkspoof -integration-peer "SERVER_B_IP:8085|SERVER_ID|CERT_FP|SECRET" -spoof-ip 8.8.8.8 -method udp -count 3 -udp-port 5555
 ```
 
 ### کدهای خروجی (Exit Codes)
@@ -89,7 +91,8 @@ sudo checkspoof -integration-peer "SERVER_B_IP:8085|SERVER_ID|CERT_FP|SECRET" -s
 | کد | وضعیت | توضیحات |
 |---|---|---|
 | `0` | `SPOOF_SUCCESS` | سرور گیرنده بسته‌های دارای آدرس IP مبدأ جعلی را دریافت کرده و اعتبار رمزنگاری‌شده آن‌ها را تأیید کرده است. |
-| `2` | `REMOTE_PACKET_NOT_RECEIVED` | بسته‌ها در سرور مبدأ تولید شده و با قوانین SNAT مطابقت داشته‌اند، اما پیش از رسیدن به گیرنده از راه دور حذف شده‌اند. این وضعیت نشان‌دهنده شناسایی فیلترینگ خروجی یا محدودیت BCP 38 است. |
+| `2` | `REMOTE_PACKET_NOT_RECEIVED` | پکت‌های کنترلی بدون جعل به گیرنده رسیدند (مسیر و پورت باز است)، اما پکت‌های با مبدأ جعلی حذف شدند. این وضعیت نشان‌دهنده فیلترینگ خروجی یا محدودیت BCP 38 است. |
+| `3` | `CONTROL_PATH_BLOCKED` | حتی پکت‌های کنترلی بدون جعل هم به گیرنده نرسیدند؛ پورت یا مسیر بسته است و نتیجه درباره اسپوفینگ نامشخص است. |
 | `1` | `ERROR` | خطا در اجرای آزمایش یا برقراری ارتباط. |
 
 ---
@@ -100,6 +103,7 @@ CheckSpoof مراحل مختلف عبور بسته در شبکه را به‌ص�
 
 | مرحله | وضعیت | توضیحات |
 |---|---|---|
+| ۰ | `CONTROL_PACKET_RECEIVED` | پیش از نصب قانون SNAT، چند پکت امضاشده با IP واقعی فرستنده ارسال می‌شود تا باز بودن مسیر و پورت ثابت شود. |
 | ۱ | `RECEIVER_LISTENER_READY` | سرور B سوکت Raw یا شنونده UDP خود را با موفقیت راه‌اندازی و اعتبارسنجی کرده است. |
 | ۲ | `SNAT_RULE_INSTALLED` | سرور A یک زنجیره اختصاصی و محدود به نشست در `iptables` با پیشوند `CSPF_*` ایجاد کرده است. |
 | ۳ | `LOCAL_PACKET_GENERATION_SUCCESS` | بسته‌ها با موفقیت در سوکت شبکه محلی نوشته شده‌اند. |
@@ -141,6 +145,10 @@ Usage of checkspoof:
         پروتکل مورد استفاده در آزمایش CLI:
         udp یا icmp
         (پیش‌فرض: udp)
+
+  -udp-port int
+        پورت UDP گیرنده در حالت CLI Integration
+        (باید روی سرور B باز باشد؛ پیش‌فرض: 5555)
 
   -count int
         تعداد بسته‌های آزمایشی ارسالی:

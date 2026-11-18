@@ -76,6 +76,19 @@ const (
 	ClassPermissionError          = "LOCAL_PERMISSION_ERROR"
 	ClassRoutingError             = "ROUTING_ERROR"
 	ClassTestIncomplete           = "TEST_INCOMPLETE"
+	ClassControlReceived          = "CONTROL_PACKET_RECEIVED"
+	ClassControlPathBlocked       = "CONTROL_PATH_BLOCKED"
+)
+
+// DefaultUDPPort is the receiver UDP port used when none is configured.
+const DefaultUDPPort = 5555
+
+// Packet frame markers: spoofed test frames vs. unspoofed control (baseline) frames.
+const (
+	frameMethodUDP     = "udp"
+	frameMethodControl = "ctl"
+	icmpMarkerSpoof    = 0xC5
+	icmpMarkerControl  = 0xC6
 )
 
 var defaultPublicIPEndpoints = []string{
@@ -172,6 +185,8 @@ type ReceiverSession struct {
 	VerifiedPackets []VerifiedPacketRecord
 	InvalidPackets  int
 	DuplicateCount  int
+	ControlSeen     map[int]bool
+	ControlPackets  []VerifiedPacketRecord
 }
 
 func (rs *ReceiverSession) Cancel() {
@@ -778,7 +793,17 @@ func (s *AppServer) doPeerRequest(ctx context.Context, peer *PeerConfig, path st
 // Packet Framing & Cryptographic Verification
 
 func BuildUDPPacketPayload(secret, sessionID, nonce string, seq int, tsMillis int64) []byte {
-	core := fmt.Sprintf("CSPFv2|%s|udp|%d|%d|%s", sessionID, seq, tsMillis, nonce)
+	return buildUDPFrame(secret, sessionID, nonce, frameMethodUDP, seq, tsMillis)
+}
+
+// BuildUDPControlPayload builds an unspoofed baseline frame. It is sent from the sender's
+// real address before the SNAT rule exists, to prove the path to the receiver port is open.
+func BuildUDPControlPayload(secret, sessionID, nonce string, seq int, tsMillis int64) []byte {
+	return buildUDPFrame(secret, sessionID, nonce, frameMethodControl, seq, tsMillis)
+}
+
+func buildUDPFrame(secret, sessionID, nonce, method string, seq int, tsMillis int64) []byte {
+	core := fmt.Sprintf("CSPFv2|%s|%s|%d|%d|%s", sessionID, method, seq, tsMillis, nonce)
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(core))
 	sig := hex.EncodeToString(mac.Sum(nil))
@@ -786,11 +811,20 @@ func BuildUDPPacketPayload(secret, sessionID, nonce string, seq int, tsMillis in
 }
 
 func ValidateUDPPacketPayload(payload []byte, secret, expectedSessionID, expectedNonce string, maxPackets int) (int, error) {
+	return validateUDPFrame(payload, secret, expectedSessionID, expectedNonce, frameMethodUDP, maxPackets)
+}
+
+// ValidateUDPControlPayload validates an unspoofed baseline frame.
+func ValidateUDPControlPayload(payload []byte, secret, expectedSessionID, expectedNonce string, maxPackets int) (int, error) {
+	return validateUDPFrame(payload, secret, expectedSessionID, expectedNonce, frameMethodControl, maxPackets)
+}
+
+func validateUDPFrame(payload []byte, secret, expectedSessionID, expectedNonce, method string, maxPackets int) (int, error) {
 	parts := strings.Split(strings.TrimSpace(string(payload)), "|")
 	if len(parts) != 7 {
 		return 0, errors.New("invalid CSPFv2 frame format")
 	}
-	if parts[0] != "CSPFv2" || parts[2] != "udp" {
+	if parts[0] != "CSPFv2" || parts[2] != method {
 		return 0, errors.New("invalid protocol header or method")
 	}
 	if parts[1] != expectedSessionID {
@@ -822,6 +856,15 @@ func ValidateUDPPacketPayload(payload []byte, secret, expectedSessionID, expecte
 }
 
 func BuildICMPPatternHex(secret, sessionID, nonce string, seq int) (string, error) {
+	return buildICMPPattern(icmpMarkerSpoof, secret, sessionID, nonce, seq)
+}
+
+// BuildICMPControlPatternHex builds the ping pattern for an unspoofed baseline echo request.
+func BuildICMPControlPatternHex(secret, sessionID, nonce string, seq int) (string, error) {
+	return buildICMPPattern(icmpMarkerControl, secret, sessionID, nonce, seq)
+}
+
+func buildICMPPattern(marker byte, secret, sessionID, nonce string, seq int) (string, error) {
 	sessBytes, err := hex.DecodeString(sessionID)
 	if err != nil || len(sessBytes) < 4 {
 		return "", errors.New("invalid sessionID hex")
@@ -834,7 +877,7 @@ func BuildICMPPatternHex(secret, sessionID, nonce string, seq int) (string, erro
 		return "", errors.New("seq out of 1..255 range")
 	}
 	frame := make([]byte, 16)
-	frame[0] = 0xC5
+	frame[0] = marker
 	copy(frame[1:5], sessBytes[:4])
 	frame[5] = byte(seq)
 	copy(frame[6:10], nonceBytes[:4])
@@ -848,6 +891,15 @@ func BuildICMPPatternHex(secret, sessionID, nonce string, seq int) (string, erro
 }
 
 func ValidateICMPRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNonce string, maxPackets int) (seq int, icmpID uint16, icmpSeq uint16, err error) {
+	return validateICMPRaw(icmpMarkerSpoof, rawPkt, secret, expectedSessionID, expectedNonce, maxPackets)
+}
+
+// ValidateICMPControlRawPacket validates an unspoofed baseline echo request.
+func ValidateICMPControlRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNonce string, maxPackets int) (seq int, icmpID uint16, icmpSeq uint16, err error) {
+	return validateICMPRaw(icmpMarkerControl, rawPkt, secret, expectedSessionID, expectedNonce, maxPackets)
+}
+
+func validateICMPRaw(marker byte, rawPkt []byte, secret, expectedSessionID, expectedNonce string, maxPackets int) (seq int, icmpID uint16, icmpSeq uint16, err error) {
 	if len(rawPkt) < 24 {
 		return 0, 0, 0, errors.New("ICMP packet too short")
 	}
@@ -880,7 +932,7 @@ func ValidateICMPRawPacket(rawPkt []byte, secret, expectedSessionID, expectedNon
 
 	for i := 0; i <= len(payload)-16; i++ {
 		chunk := payload[i : i+16]
-		if chunk[0] != 0xC5 {
+		if chunk[0] != marker {
 			continue
 		}
 		if !bytes.Equal(chunk[1:5], sessBytes[:4]) {
@@ -1382,6 +1434,8 @@ func (s *AppServer) StartReceiverSessionWithContext(callerCtx context.Context, r
 		State:            RecvInitializing,
 		SeenSeq:          make(map[int]bool),
 		VerifiedPackets:  []VerifiedPacketRecord{},
+		ControlSeen:      make(map[int]bool),
+		ControlPackets:   []VerifiedPacketRecord{},
 	}
 
 	if callerCtx.Err() != nil {
@@ -1566,6 +1620,59 @@ func (s *AppServer) CancelReceiverSession(sessionID string) bool {
 	return true
 }
 
+// candidateSecrets returns the distinct shared secrets a valid frame may be signed with.
+func (s *AppServer) candidateSecrets(primary string) []string {
+	out := []string{primary}
+	for _, alt := range []string{s.PairingSecret, s.activeSharedSecret()} {
+		dup := false
+		for _, have := range out {
+			if have == alt {
+				dup = true
+				break
+			}
+		}
+		if !dup && alt != "" {
+			out = append(out, alt)
+		}
+	}
+	return out
+}
+
+func (s *AppServer) validateUDPControlWithAnySecret(payload []byte, primarySecret string, sess *ReceiverSession) (int, error) {
+	err := errors.New("no secret configured")
+	for _, sec := range s.candidateSecrets(primarySecret) {
+		var seq int
+		if seq, err = ValidateUDPControlPayload(payload, sec, sess.SessionID, sess.Nonce, sess.MaxPackets); err == nil {
+			return seq, nil
+		}
+	}
+	return 0, err
+}
+
+func (s *AppServer) validateICMPControlWithAnySecret(rawPkt []byte, primarySecret string, sess *ReceiverSession) (int, uint16, uint16, error) {
+	err := errors.New("no secret configured")
+	for _, sec := range s.candidateSecrets(primarySecret) {
+		var seq int
+		var id, iSeq uint16
+		if seq, id, iSeq, err = ValidateICMPControlRawPacket(rawPkt, sec, sess.SessionID, sess.Nonce, sess.MaxPackets); err == nil {
+			return seq, id, iSeq, nil
+		}
+	}
+	return 0, 0, 0, err
+}
+
+// recordControlPacket stores a verified baseline packet; returns false for duplicates.
+func (sess *ReceiverSession) recordControlPacket(rec VerifiedPacketRecord) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.ControlSeen[rec.Seq] {
+		return false
+	}
+	sess.ControlSeen[rec.Seq] = true
+	sess.ControlPackets = append(sess.ControlPackets, rec)
+	return true
+}
+
 func (s *AppServer) validateUDPWithAnySecret(payload []byte, primarySecret string, sess *ReceiverSession) (int, error) {
 	seq, err := ValidateUDPPacketPayload(payload, primarySecret, sess.SessionID, sess.Nonce, sess.MaxPackets)
 	if err == nil {
@@ -1652,7 +1759,16 @@ func (s *AppServer) runUDPReceiverLoop(ctx context.Context, conn net.PacketConn,
 			return
 		}
 		sourceIP := extractIPString(remoteAddr)
-		if n <= 0 || sourceIP != sess.ExpectedSourceIP {
+		if n <= 0 {
+			continue
+		}
+		if cSeq, cErr := s.validateUDPControlWithAnySecret(buf[:n], secret, sess); cErr == nil {
+			if sess.recordControlPacket(VerifiedPacketRecord{Seq: cSeq, SourceIP: sourceIP, Protocol: "udp-control", PayloadBytes: n, Timestamp: time.Now().Format("15:04:05.000")}) {
+				s.AddLog(fmt.Sprintf("🧪 [Receiver] Control UDP packet #%d arrived from real sender IP %s (path is open)", cSeq, sourceIP))
+			}
+			continue
+		}
+		if sourceIP != sess.ExpectedSourceIP {
 			continue
 		}
 		seq, valErr := s.validateUDPWithAnySecret(buf[:n], secret, sess)
@@ -1732,7 +1848,16 @@ func (s *AppServer) runICMPReceiverLoop(ctx context.Context, conn net.PacketConn
 			return
 		}
 		sourceIP := extractIPString(addr)
-		if n <= 0 || sourceIP != sess.ExpectedSourceIP {
+		if n <= 0 {
+			continue
+		}
+		if cSeq, cID, cISeq, cErr := s.validateICMPControlWithAnySecret(buf[:n], secret, sess); cErr == nil {
+			if sess.recordControlPacket(VerifiedPacketRecord{Seq: cSeq, SourceIP: sourceIP, Protocol: "icmp-control", ICMPID: cID, ICMPSeq: cISeq, PayloadBytes: n, Timestamp: time.Now().Format("15:04:05.000")}) {
+				s.AddLog(fmt.Sprintf("🧪 [Receiver] Control ICMP echo #%d arrived from real sender IP %s (path is open)", cSeq, sourceIP))
+			}
+			continue
+		}
+		if sourceIP != sess.ExpectedSourceIP {
 			continue
 		}
 		seq, icmpID, icmpSeq, valErr := s.validateICMPWithAnySecret(buf[:n], secret, sess)
@@ -2139,6 +2264,8 @@ type PeerSessionReportResponse struct {
 	DuplicateCount  int                    `json:"duplicate_count"`
 	VerifiedPackets []VerifiedPacketRecord `json:"verified_packets"`
 	LastError       string                 `json:"last_error,omitempty"`
+	ControlCount    int                    `json:"control_count"`
+	ControlPackets  []VerifiedPacketRecord `json:"control_packets,omitempty"`
 }
 
 func (s *AppServer) handlePeerResults(w http.ResponseWriter, r *http.Request) {
@@ -2171,6 +2298,8 @@ func (s *AppServer) handlePeerResults(w http.ResponseWriter, r *http.Request) {
 	sess.mu.Lock()
 	pkts := make([]VerifiedPacketRecord, len(sess.VerifiedPackets))
 	copy(pkts, sess.VerifiedPackets)
+	ctlPkts := make([]VerifiedPacketRecord, len(sess.ControlPackets))
+	copy(ctlPkts, sess.ControlPackets)
 	resp := PeerSessionReportResponse{
 		SessionID:       sess.SessionID,
 		State:           sess.State,
@@ -2179,6 +2308,8 @@ func (s *AppServer) handlePeerResults(w http.ResponseWriter, r *http.Request) {
 		DuplicateCount:  sess.DuplicateCount,
 		VerifiedPackets: pkts,
 		LastError:       sess.LastError,
+		ControlCount:    len(ctlPkts),
+		ControlPackets:  ctlPkts,
 	}
 	sess.mu.Unlock()
 
@@ -2324,6 +2455,7 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 		SpoofIP     string `json:"spoof_ip"`
 		TestType    string `json:"test_type"`
 		PacketCount int    `json:"packet_count"`
+		UDPPort     int    `json:"udp_port,omitempty"`
 	}
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -2344,6 +2476,13 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 	if req.PacketCount <= 0 || req.PacketCount > 10 {
 		req.PacketCount = 3
 	}
+	if req.UDPPort == 0 {
+		req.UDPPort = DefaultUDPPort
+	}
+	if req.UDPPort < 1 || req.UDPPort > 65535 {
+		http.Error(w, "پورت UDP باید بین 1 تا 65535 باشد", http.StatusBadRequest)
+		return
+	}
 
 	s.mu.RLock()
 	peer := s.Peer
@@ -2362,7 +2501,7 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 		Nonce:            nonce,
 		ExpectedSourceIP: req.SpoofIP,
 		TestType:         req.TestType,
-		UDPPort:          5555,
+		UDPPort:          req.UDPPort,
 		MaxPackets:       req.PacketCount,
 		TimeoutSec:       45,
 	}
@@ -2393,7 +2532,7 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 		Nonce:            nonce,
 		ExpectedSourceIP: req.SpoofIP,
 		TestType:         req.TestType,
-		UDPPort:          5555,
+		UDPPort:          req.UDPPort,
 		PacketCount:      req.PacketCount,
 		PreparedAt:       time.Now(),
 	}
@@ -2406,6 +2545,7 @@ func (s *AppServer) handleAdminPrepare(w http.ResponseWriter, r *http.Request) {
 		"session_id":     sessionID,
 		"receiver_state": prepResp.ReceiverState,
 		"bound_address":  prepResp.BoundAddress,
+		"udp_port":       req.UDPPort,
 	})
 }
 
@@ -2427,6 +2567,10 @@ type AdminTestResult struct {
 	RemoteVerifiedCount   int                    `json:"remote_verified_count"`
 	RemoteInvalidCount    int                    `json:"remote_invalid_count"`
 	RemoteDuplicateCount  int                    `json:"remote_duplicate_count"`
+	ControlPacketsSent    int                    `json:"control_packets_sent"`
+	ControlReceivedCount  int                    `json:"control_received_count"`
+	ControlObservedIP     string                 `json:"control_observed_ip,omitempty"`
+	UDPPort               int                    `json:"udp_port,omitempty"`
 	VerifiedPackets       []VerifiedPacketRecord `json:"verified_packets"`
 	OutgoingInterface     string                 `json:"outgoing_interface"`
 	OutgoingSourceIP      string                 `json:"outgoing_source_ip"`
@@ -2474,6 +2618,48 @@ func (s *AppServer) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	result := s.executeCoordinatedTest(r.Context(), peer, prep)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// sendControlPackets sends unspoofed, HMAC-signed baseline packets from the sender's real
+// address. For UDP the open socket is returned so the caller can hold its source port.
+func (s *AppServer) sendControlPackets(ctx context.Context, peer *PeerConfig, prep *PreparedSessionInfo, targetIP string) (net.Conn, int) {
+	sent := 0
+	if prep.TestType == "udp" {
+		raddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(targetIP, strconv.Itoa(prep.UDPPort)))
+		if err != nil {
+			s.AddLog(fmt.Sprintf("[-] [Control] %v", err))
+			return nil, 0
+		}
+		conn, err := net.DialUDP("udp4", nil, raddr)
+		if err != nil {
+			s.AddLog(fmt.Sprintf("[-] [Control] %v", err))
+			return nil, 0
+		}
+		for seq := 1; seq <= prep.PacketCount; seq++ {
+			payload := BuildUDPControlPayload(peer.SharedSecret, prep.SessionID, prep.Nonce, seq, time.Now().UnixMilli())
+			if n, wErr := conn.Write(payload); wErr == nil && n == len(payload) {
+				sent++
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		s.AddLog(fmt.Sprintf("[Control] Sent %d unspoofed UDP baseline packets to %s:%d", sent, targetIP, prep.UDPPort))
+		return conn, sent
+	}
+
+	for seq := 1; seq <= prep.PacketCount; seq++ {
+		patHex, err := BuildICMPControlPatternHex(peer.SharedSecret, prep.SessionID, prep.Nonce, seq)
+		if err != nil {
+			break
+		}
+		pingCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+		out, exitCode, _ := s.Runner.Run(pingCtx, "ping", "-c", "1", "-W", "1", "-s", "48", "-p", patHex, targetIP)
+		cancel()
+		if exitCode == 0 || strings.Contains(string(out), "transmitted") {
+			sent++
+		}
+	}
+	s.AddLog(fmt.Sprintf("[Control] Sent %d unspoofed ICMP baseline echo requests to %s", sent, targetIP))
+	return nil, sent
 }
 
 func (s *AppServer) isGenuineNetworkSpoofSetup(targetIP, spoofIP string, routeSrcIP ...string) (bool, string) {
@@ -2551,6 +2737,21 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	iface := routeInfo.Interface
 	res.OutgoingInterface = iface
 	res.OutgoingSourceIP = routeInfo.SourceIP
+	if prep.TestType == "udp" {
+		res.UDPPort = prep.UDPPort
+	}
+
+	// Stage 1b: Unspoofed control (baseline) packets, sent BEFORE any SNAT rule exists.
+	// If these never arrive, the receiver port/path is blocked and a missing spoofed
+	// packet says nothing about source-address filtering.
+	controlConn, controlSent := s.sendControlPackets(ctx, peer, prep, targetIP)
+	if controlConn != nil {
+		// Keep the control socket open until the spoofed packets are sent so the kernel cannot
+		// reuse its source port (an existing conntrack entry would bypass the SNAT rule).
+		defer controlConn.Close()
+	}
+	res.ControlPacketsSent = controlSent
+	time.Sleep(300 * time.Millisecond)
 
 	// Stage 2: Isolated Per-Process/Per-Session iptables SNAT Chain Installation
 	shortID := prep.SessionID[:8]
@@ -2678,6 +2879,13 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		}
 	}
 
+	res.ControlReceivedCount = remoteReport.ControlCount
+	if len(remoteReport.ControlPackets) > 0 {
+		res.ControlObservedIP = remoteReport.ControlPackets[0].SourceIP
+	}
+	if res.ControlReceivedCount > 0 {
+		res.Classifications = append(res.Classifications, ClassControlReceived)
+	}
 	res.RemoteVerifiedCount = matchingSpoofSourceCount
 	res.RemoteInvalidCount = remoteReport.InvalidCount
 	res.RemoteDuplicateCount = remoteReport.DuplicateCount
@@ -2718,6 +2926,21 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 		return res
 	}
 
+	if res.ControlReceivedCount == 0 {
+		res.RemoteSpoofVerified = false
+		res.PrimaryClassification = ClassControlPathBlocked
+		res.Classifications = append(res.Classifications, ClassControlPathBlocked)
+		res.StatusClass = "warning"
+		res.ResultTitle = "⚠️ نتیجه نامشخص — حتی پکت کنترلی بدون جعل هم به سرور دوم نرسید (CONTROL_PATH_BLOCKED)"
+		portHint := ""
+		if prep.TestType == "udp" {
+			portHint = fmt.Sprintf(" پورت UDP %d را در فایروال سرور دوم و فایروال ابری (Security Group) باز کنید.", prep.UDPPort)
+		}
+		res.ConfirmedEvidence = fmt.Sprintf("%d پکت کنترلی با IP واقعی ارسال شد اما ۰ پکت به گیرنده رسید؛ بنابراین مسیر یا پورت مقصد بسته است و نبود پکت اسپوف‌شده دلیلی بر فیلترینگ BCP 38 نیست.", controlSent)
+		res.PossibleExplanations = "فایروال سرور دوم، فایروال ابری یا فیلتر مسیر ترافیک تست را مسدود کرده است." + portHint
+		return res
+	}
+
 	res.RemoteSpoofVerified = false
 	res.PrimaryClassification = ClassRemoteNotReceived
 	res.Classifications = append(res.Classifications, ClassRemoteNotReceived)
@@ -2725,13 +2948,17 @@ func (s *AppServer) executeCoordinatedTest(ctx context.Context, peer *PeerConfig
 	res.ResultTitle = "❌ عدم دریافت پکت اسپوف‌شده در سرور دوم (REMOTE_PACKET_NOT_RECEIVED)"
 	res.ConfirmedEvidence = fmt.Sprintf("شواهد تفکیک‌شده: ۱) شنونده مقصد آماده بود، ۲) زنجیره SNAT (%s) روی %s (آدرس محلی %s) نصب شد، ۳) %d پکت در مبدا تولید شد و ۴) %d پکت (%d بایت) با قانون SNAT محلی تطابق یافت؛ اما ۵) سرور دوم ۰ پکت با آدرس اسپوف‌شده (%s) دریافت کرد. (نصب قانون یا افزایش شمارنده SNAT به تنهایی دلیل موفقیت اسپوفینگ نیست.)",
 		chainIso.ChainName, iface, routeInfo.SourceIP, packetsSent, snatPkts, snatBytes, prep.ExpectedSourceIP)
-	res.PossibleExplanations = "دلایل محتمل: ۱) فیلترینگ مبدا در روتر بالادست یا دیتاسنتر فرستنده (BCP 38 / uRPF) یا NAT بالادست، ۲) مسدود شدن در فایروال مسیر یا سرور مقصد، ۳) عدم تطابق مسیر خروجی یا از دست رفتن پکت در شبکه."
+	res.ConfirmedEvidence += fmt.Sprintf(" پکت‌های کنترلی بدون جعل (%d/%d) از %s به گیرنده رسیدند، پس مسیر و پورت باز است.", res.ControlReceivedCount, controlSent, res.ControlObservedIP)
+	res.PossibleExplanations = "مسیر باز است اما پکت‌های با مبدا جعلی حذف شدند؛ محتمل‌ترین دلیل فیلترینگ مبدا (BCP 38 / uRPF / anti-spoofing) در شبکه یا هایپروایزر فرستنده است."
+	if res.ControlObservedIP != "" && res.ControlObservedIP != routeInfo.SourceIP {
+		res.PossibleExplanations += fmt.Sprintf(" توجه: گیرنده IP فرستنده را %s دید در حالی که IP محلی %s است؛ فرستنده پشت NAT است و NAT بالادست آدرس مبدا را بازنویسی می‌کند.", res.ControlObservedIP, routeInfo.SourceIP)
+	}
 	return res
 }
 
 // RunRealVPSIntegrationTest executes a complete two-server spoofing verification test
 // against a paired remote Linux VPS.
-func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, spoofIP, testMethod string, packetCount int) (AdminTestResult, error) {
+func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, spoofIP, testMethod string, packetCount, udpPort int) (AdminTestResult, error) {
 	peerCfg, err := ParsePairingToken(peerToken)
 	if err != nil {
 		return AdminTestResult{}, fmt.Errorf("invalid peer token: %w", err)
@@ -2744,6 +2971,12 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 	}
 	if packetCount <= 0 || packetCount > 10 {
 		packetCount = 3
+	}
+	if udpPort == 0 {
+		udpPort = DefaultUDPPort
+	}
+	if udpPort < 1 || udpPort > 65535 {
+		return AdminTestResult{}, fmt.Errorf("invalid UDP port %d (use 1..65535)", udpPort)
 	}
 
 	routeInfo, routeErr := s.ResolveRoute(ctx, peerCfg.ControlIP)
@@ -2793,7 +3026,7 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 		Nonce:            nonce,
 		ExpectedSourceIP: spoofIP,
 		TestType:         testMethod,
-		UDPPort:          5555,
+		UDPPort:          udpPort,
 		MaxPackets:       packetCount,
 		TimeoutSec:       45,
 	}
@@ -2810,7 +3043,7 @@ func (s *AppServer) RunRealVPSIntegrationTest(ctx context.Context, peerToken, sp
 		Nonce:            nonce,
 		ExpectedSourceIP: spoofIP,
 		TestType:         testMethod,
-		UDPPort:          5555,
+		UDPPort:          udpPort,
 		PacketCount:      packetCount,
 		PreparedAt:       time.Now(),
 	}
@@ -2900,527 +3133,360 @@ type DashboardData struct {
 const dashboardHTML = `<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CheckSpoof — سامانه مهندسی تشخیص IP Spoofing</title>
-    <link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
-    <style>
-        :root {
-            --bg-dark: #070b14;
-            --bg-card: rgba(15, 23, 42, 0.9);
-            --bg-input: #090e1a;
-            --border: #1e293b;
-            --accent: #38bdf8;
-            --accent-glow: rgba(56, 189, 248, 0.2);
-            --primary-grad: linear-gradient(135deg, #0284c7 0%, #2563eb 100%);
-            --emerald-grad: linear-gradient(135deg, #059669 0%, #10b981 100%);
-            --amber-grad: linear-gradient(135deg, #d97706 0%, #f59e0b 100%);
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --success-bg: rgba(20, 83, 45, 0.45);
-            --success-border: #22c55e;
-            --success-fg: #4ade80;
-            --warning-bg: rgba(113, 63, 18, 0.45);
-            --warning-border: #eab308;
-            --warning-fg: #facc15;
-            --danger-bg: rgba(127, 29, 29, 0.45);
-            --danger-border: #ef4444;
-            --danger-fg: #f87171;
-        }
-        * { box-sizing: border-box; }
-        body {
-            background-color: var(--bg-dark);
-            background-image: radial-gradient(at 0% 0%, rgba(14, 165, 233, 0.12) 0px, transparent 50%),
-                              radial-gradient(at 100% 100%, rgba(37, 99, 235, 0.1) 0px, transparent 50%);
-            color: var(--text-main);
-            font-family: 'Vazirmatn', system-ui, -apple-system, sans-serif;
-            margin: 0; padding: 20px 14px; min-height: 100vh;
-        }
-        .wrapper { max-width: 1220px; margin: 0 auto; }
-        .navbar {
-            display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
-            background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
-            padding: 16px 22px; margin-bottom: 16px; gap: 12px;
-        }
-        .brand { display: flex; align-items: center; gap: 12px; }
-        .brand-icon {
-            width: 42px; height: 42px; border-radius: 11px; background: var(--primary-grad);
-            display: flex; align-items: center; justify-content: center; font-size: 20px;
-        }
-        .brand-text h1 { margin: 0; font-size: 19px; font-weight: 800; color: #fff; }
-        .brand-text p { margin: 2px 0 0 0; font-size: 11.5px; color: var(--text-muted); }
-        .nav-pills { display: flex; flex-wrap: wrap; gap: 8px; }
-        .pill {
-            background: var(--bg-input); border: 1px solid var(--border); padding: 6px 12px;
-            border-radius: 999px; font-size: 11.5px; color: var(--text-muted);
-            display: flex; align-items: center; gap: 6px;
-        }
-        .pill strong { color: var(--accent); font-family: monospace; font-size: 12px; }
-        .token-banner {
-            background: linear-gradient(90deg, rgba(15, 23, 42, 0.95) 0%, rgba(2, 132, 199, 0.1) 100%);
-            border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 14px;
-            padding: 12px 18px; margin-bottom: 18px; display: flex; flex-wrap: wrap;
-            justify-content: space-between; align-items: center; gap: 10px;
-        }
-        .token-value-wrap {
-            display: flex; align-items: center; gap: 8px; background: #050811;
-            padding: 7px 12px; border-radius: 10px; border: 1px solid var(--border);
-            direction: ltr; flex: 1; max-width: 650px; justify-content: space-between;
-        }
-        .token-value-wrap code { color: #4ade80; font-family: monospace; font-size: 12px; word-break: break-all; user-select: all; }
-        .btn-sm {
-            background: #1e293b; color: #f8fafc; border: 1px solid #334155; padding: 5px 10px;
-            border-radius: 6px; font-family: inherit; font-size: 11.5px; cursor: pointer; white-space: nowrap;
-        }
-        .btn-sm:hover { border-color: var(--accent); }
-        .dashboard-grid { display: grid; grid-template-columns: 1.05fr 1.15fr; gap: 18px; }
-        @media (max-width: 960px) { .dashboard-grid { grid-template-columns: 1fr; } }
-        .card {
-            background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px;
-            padding: 20px; display: flex; flex-direction: column; gap: 14px;
-        }
-        .card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-        .card-title { margin: 0; font-size: 15px; font-weight: 700; color: #fff; }
-        .form-group { display: flex; flex-direction: column; gap: 5px; }
-        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-        label { font-size: 12px; color: var(--text-muted); }
-        input, select {
-            width: 100%; padding: 10px 12px; background: var(--bg-input); border: 1px solid var(--border);
-            color: #fff; border-radius: 9px; font-family: inherit; font-size: 13px; outline: none;
-        }
-        input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
-        .ltr-input { direction: ltr; text-align: left; font-family: monospace; }
-        .connect-group { display: flex; gap: 8px; }
-        .btn-connect {
-            background: var(--emerald-grad); color: #fff; border: none; padding: 0 16px;
-            border-radius: 9px; font-family: inherit; font-size: 12.5px; font-weight: 700; cursor: pointer; white-space: nowrap;
-        }
-        .action-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }
-        .btn-prepare {
-            background: var(--amber-grad); color: #fff; border: none; padding: 13px 14px;
-            border-radius: 10px; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
-        }
-        .btn-primary {
-            background: var(--primary-grad); color: #fff; border: none; padding: 13px 14px;
-            border-radius: 10px; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
-        }
-        .btn-prepare:disabled, .btn-primary:disabled {
-            background: #1e293b; color: #64748b; cursor: not-allowed; border: 1px solid #334155;
-        }
-        .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-        .chip {
-            background: #131c31; border: 1px solid var(--border); color: #cbd5e1;
-            padding: 4px 10px; border-radius: 7px; font-size: 11px; cursor: pointer; font-family: monospace;
-        }
-        .chip:hover { border-color: var(--accent); color: var(--accent); }
-        .metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-        .metric-box { background: var(--bg-input); border: 1px solid var(--border); border-radius: 10px; padding: 10px; text-align: center; }
-        .metric-box .m-title { font-size: 10.5px; color: var(--text-muted); margin-bottom: 3px; }
-        .metric-box .m-val { font-size: 13px; font-weight: 800; font-family: monospace; color: #fff; }
-        .alert-box { padding: 12px 14px; border-radius: 10px; font-size: 12.5px; line-height: 1.65; display: none; }
-        .alert-box.show { display: block; }
-        .alert-box strong { display: block; font-size: 13.5px; margin-bottom: 4px; }
-        .alert-box.success { background: var(--success-bg); border: 1px solid var(--success-border); color: var(--success-fg); }
-        .alert-box.warning { background: var(--warning-bg); border: 1px solid var(--warning-border); color: var(--warning-fg); }
-        .alert-box.failure { background: var(--danger-bg); border: 1px solid var(--danger-border); color: var(--danger-fg); }
-        .terminal-window { background: #03060c; border: 1px solid #1e293b; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; flex: 1; min-height: 340px; }
-        .terminal-bar { background: #0b1324; padding: 8px 14px; border-bottom: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center; direction: ltr; }
-        #terminal { padding: 14px; color: #34d399; font-family: monospace; font-size: 12px; line-height: 1.6; overflow-y: auto; flex: 1; max-height: 380px; white-space: pre-wrap; direction: ltr; text-align: left; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CheckSpoof</title>
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
+<style>
+:root{
+  --bg:#09090b; --surface:#111113; --surface-2:#18181b; --line:#232326; --line-2:#2e2e33;
+  --text:#fafafa; --muted:#a1a1aa; --faint:#71717a;
+  --accent:#a78bfa; --accent-ink:#0b0613;
+  --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --r:14px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text)}
+body{font-family:'Vazirmatn',system-ui,-apple-system,sans-serif;font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 20px 48px}
+.mono,code,input.ltr{font-family:var(--mono);direction:ltr}
+/* header */
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:28px}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(140deg,#c4b5fd,#7c3aed);display:grid;place-items:center}
+.logo svg{width:18px;height:18px}
+.brand h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.01em}
+.brand p{margin:0;color:var(--faint);font-size:12px}
+.status{display:flex;gap:8px;flex-wrap:wrap}
+.tag{display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border:1px solid var(--line);border-radius:999px;font-size:12px;color:var(--muted);background:var(--surface)}
+.tag b{color:var(--text);font-weight:500;font-family:var(--mono);font-size:11.5px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,.15)}
+.dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+/* layout */
+.grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:16px}
+@media(max-width:900px){.grid{grid-template-columns:minmax(0,1fr)}}
+
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:20px}
+.card+.card{margin-top:16px}
+.card h2{margin:0 0 4px;font-size:14px;font-weight:600}
+.card .sub{margin:0 0 16px;color:var(--faint);font-size:12.5px}
+.step{display:flex;gap:14px}
+.step+.step{margin-top:20px;padding-top:20px;border-top:1px solid var(--line)}
+.num{flex:none;width:24px;height:24px;border-radius:50%;border:1px solid var(--line-2);display:grid;place-items:center;font-size:12px;color:var(--muted);font-family:var(--mono)}
+.step.done .num{background:var(--ok);border-color:var(--ok);color:#052e1f}
+.step.active .num{border-color:var(--accent);color:var(--accent)}
+.body{flex:1;min-width:0}
+.body h3{margin:1px 0 10px;font-size:13.5px;font-weight:600}
+/* form */
+label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
+input,select{width:100%;height:40px;padding:0 12px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;color:var(--text);font:inherit;font-size:13px;outline:none;transition:border-color .15s,box-shadow .15s}
+input.ltr{text-align:left;font-size:12.5px}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(167,139,250,.15)}
+input[readonly]{color:var(--muted)}
+.row{display:flex;gap:8px}
+.row>input{flex:1}
+.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.fields .full{grid-column:1/-1}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.chip{border:1px solid var(--line);background:transparent;color:var(--muted);border-radius:999px;padding:3px 10px;font-family:var(--mono);font-size:11.5px;cursor:pointer}
+.chip:hover{color:var(--text);border-color:var(--line-2)}
+.hint{color:var(--faint);font-size:11.5px;margin-top:6px}
+/* buttons */
+.btn{height:40px;padding:0 16px;border-radius:10px;border:1px solid var(--line-2);background:var(--surface-2);color:var(--text);font:inherit;font-size:13px;font-weight:500;cursor:pointer;white-space:nowrap;transition:background .15s,opacity .15s,border-color .15s}
+.btn:hover:not(:disabled){border-color:#3f3f46}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+.btn.primary:hover:not(:disabled){background:#b9a3fc}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.ghost{height:30px;padding:0 10px;font-size:12px;background:transparent}
+.actions{display:flex;gap:8px;margin-top:14px}
+.actions .btn{flex:1}
+/* token */
+.token{display:flex;align-items:center;gap:8px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:6px 6px 6px 12px;direction:ltr}
+.token code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--muted)}
+/* notices */
+.note{display:none;margin-top:12px;padding:10px 12px;border-radius:10px;font-size:12.5px;border:1px solid var(--line);background:var(--surface-2);color:var(--muted)}
+.note.show{display:block}
+.note.ok{border-color:rgba(52,211,153,.3);color:#a7f3d0}
+.note.warn{border-color:rgba(251,191,36,.3);color:#fde68a}
+.note.bad{border-color:rgba(248,113,113,.3);color:#fecaca}
+/* result */
+.verdict{display:flex;align-items:flex-start;gap:12px}
+.verdict .badge{flex:none;width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:var(--surface-2);border:1px solid var(--line);font-size:16px}
+.verdict.success .badge{background:rgba(52,211,153,.12);border-color:rgba(52,211,153,.35);color:var(--ok)}
+.verdict.warning .badge{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.35);color:var(--warn)}
+.verdict.failure .badge{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.35);color:var(--bad)}
+.verdict h3{margin:0;font-size:14px;font-weight:600}
+.verdict .cls{font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+.stages{list-style:none;margin:18px 0 0;padding:0}
+.stages li{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;border-top:1px solid var(--line);font-size:12.5px;color:var(--muted)}
+.stages li:first-child{border-top:0}
+.stages .v{font-family:var(--mono);font-size:12px;color:var(--text);direction:ltr}
+.stages .s{display:inline-flex;align-items:center;gap:8px}
+.detail{margin-top:14px;font-size:12.5px;color:var(--muted)}
+.detail p{margin:0 0 6px}
+.empty{color:var(--faint);font-size:12.5px}
+/* log */
+.logbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+#terminal{height:300px;overflow:auto;margin:0;padding:12px;background:#060607;border:1px solid var(--line);border-radius:10px;font-family:var(--mono);font-size:11.5px;line-height:1.7;color:#d4d4d8;white-space:pre-wrap;direction:ltr;text-align:left}
+#terminal::-webkit-scrollbar{width:8px}#terminal::-webkit-scrollbar-thumb{background:#27272a;border-radius:8px}
+.listen{display:none;align-items:center;gap:8px;font-size:12px;color:#a7f3d0}
+.listen.show{display:inline-flex}
+.foot{margin-top:28px;color:var(--faint);font-size:11.5px;text-align:center}
+@media(max-width:520px){.wrap{padding:20px 14px 36px}.actions{flex-direction:column}.actions .btn{flex:none;width:100%}}
+</style>
 </head>
 <body>
-    <div class="wrapper">
-        <header class="navbar">
-            <div class="brand">
-                <div class="brand-icon">🛡️</div>
-                <div class="brand-text">
-                    <h1>CheckSpoof Enterprise v2</h1>
-                    <p>سامانه مهندسی تشخیص IP Spoofing با تفکیک آدرس محلی (ip route) از آدرس عمومی (Public IP)</p>
-                </div>
-            </div>
-            <div class="nav-pills">
-                <div class="pill"><span>شناسه:</span><strong>{{.ServerID}}</strong></div>
-                <div class="pill"><span>IP محلی ({{.Iface}}):</span><strong id="local_ip_badge">{{.LocalOutboundIP}}</strong></div>
-                <div class="pill"><span>IP عمومی:</span><strong id="public_ip_badge">{{.PublicIP}} ({{.PublicIPSource}})</strong></div>
-                <div class="pill"><span>وضعیت اتصال:</span><strong id="conn_state_badge">DISCONNECTED</strong></div>
-                <div class="pill"><span>وضعیت سرور دوم:</span><strong id="recv_state_badge">IDLE</strong></div>
-                <div class="pill"><span>آخرین ضربان:</span><strong id="hb_badge">—</strong></div>
-            </div>
-        </header>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
+      <div>
+        <h1>CheckSpoof</h1>
+        <p>آزمون جعل آدرس مبدا بین دو سرور</p>
+      </div>
+    </div>
+    <div class="status">
+      <span class="tag"><span class="dot" id="conn_dot"></span><b id="conn_state_badge">DISCONNECTED</b></span>
+      <span class="tag">محلی <b id="local_ip_badge">{{.LocalOutboundIP}}</b></span>
+      <span class="tag">عمومی <b id="public_ip_badge">{{.PublicIP}}</b></span>
+      <span class="tag">شناسه <b>{{.ServerID}}</b></span>
+    </div>
+  </header>
 
-        <div class="token-banner">
-            <div style="font-size: 12.5px;">
-                🔑 <strong>توکن جفت‌سازی امن این سرور (کپی کرده و در سرور مقابل وارد کنید):</strong>
+  <div class="grid">
+    <div>
+      <section class="card">
+        <h2>توکن این سرور</h2>
+        <p class="sub">این توکن را در داشبورد سرور فرستنده وارد کنید.</p>
+        <div class="token">
+          <code id="my_token" data-token="{{.PairingToken}}">{{.PairingToken}}</code>
+          <button class="btn ghost" onclick="toggleToken()" id="toggle_btn">مخفی</button>
+          <button class="btn ghost" onclick="copyToken()" id="copy_btn">کپی</button>
+        </div>
+        <details style="margin-top:12px">
+          <summary style="cursor:pointer;color:var(--faint);font-size:12px">تنظیم دستی IP عمومی (برای سرورهای پشت NAT)</summary>
+          <div class="row" style="margin-top:10px">
+            <input type="text" id="manual_public_ip" class="ltr" placeholder="203.0.113.50">
+            <button class="btn" onclick="savePublicIP()">ذخیره</button>
+          </div>
+          <div class="note" id="pubip_note"></div>
+        </details>
+      </section>
+
+      <section class="card">
+        <div class="step active" id="step1">
+          <div class="num">1</div>
+          <div class="body">
+            <h3>اتصال به سرور گیرنده</h3>
+            <div class="row">
+              <input type="text" id="remote_token" class="ltr" placeholder="IP:PORT|SERVER_ID|CERT_FP|SECRET">
+              <button class="btn primary" onclick="pairServer()" id="pair_btn">اتصال</button>
             </div>
-            <div class="token-value-wrap">
-                <code id="my_token" data-token="{{.PairingToken}}">{{.PairingToken}}</code>
-                <div style="display:flex; gap:6px;">
-                    <button class="btn-sm" onclick="toggleToken()" id="toggle_btn">مخفی کردن</button>
-                    <button class="btn-sm" onclick="copyToken()" id="copy_btn">کپی توکن</button>
-                </div>
-            </div>
+            <div class="note" id="pair_alert"></div>
+          </div>
         </div>
 
-        <div class="dashboard-grid">
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">⚙️ ۱. تنظیمات شبکه، اتصال TLS 1.3 و ارسال پکت</h2>
-                </div>
-
-                <div class="form-group">
-                    <label>🌐 تنظیم دستی IP عمومی این سرور (اختیاری — در صورت قرارگیری پشت NAT یا UNKNOWN بودن):</label>
-                    <div class="connect-group">
-                        <input type="text" id="manual_public_ip" class="ltr-input" placeholder="مثال: 203.0.113.50">
-                        <button class="btn-sm" onclick="savePublicIP()">ثبت IP عمومی</button>
-                    </div>
-                </div>
-
-                <div class="form-group">
-                    <label>🔗 توکن سرور دوم (گیرنده):</label>
-                    <div class="connect-group">
-                        <input type="text" id="remote_token" class="ltr-input" placeholder="IP:PORT|SERVER_ID|CERT_FP|SECRET">
-                        <button class="btn-connect" onclick="pairServer()" id="pair_btn">اتصال به سرور دوم</button>
-                    </div>
-                    <div id="pair_alert" class="alert-box"></div>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>🛠️ متد تست پروتکل:</label>
-                        <select id="test_type" onchange="invalidatePrepare()">
-                            <option value="icmp">Method 1 — ICMP SNAT (پینگ با امضای رمزنگاری)</option>
-                            <option value="udp">Method 2 — UDP SNAT (فریم رمزنگاری CSPFv2)</option>
-                            <option value="raw" disabled>Method 3 — Raw IP Header (NOT IMPLEMENTED)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>🔢 تعداد پکت‌های تست (۱ تا ۱۰):</label>
-                        <input type="number" id="packet_count" class="ltr-input" value="3" min="1" max="10" onchange="invalidatePrepare()">
-                    </div>
-                </div>
-
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>🎯 سرور مقصد (گیرنده):</label>
-                        <input type="text" id="target_ip" class="ltr-input" readonly placeholder="پس از اتصال خودکار پر می‌شود">
-                    </div>
-                    <div class="form-group">
-                        <label>🎭 آدرس IP جعلی (Spoofed Source IP):</label>
-                        <input type="text" id="spoof_ip" class="ltr-input" value="8.8.8.8" oninput="invalidatePrepare()">
-                    </div>
-                </div>
-
+        <div class="step" id="step2">
+          <div class="num">2</div>
+          <div class="body">
+            <h3>تنظیمات آزمون</h3>
+            <div class="fields">
+              <div>
+                <label for="test_type">پروتکل</label>
+                <select id="test_type" onchange="onTypeChange()">
+                  <option value="udp">UDP</option>
+                  <option value="icmp">ICMP</option>
+                </select>
+              </div>
+              <div>
+                <label for="packet_count">تعداد پکت</label>
+                <input type="number" id="packet_count" class="ltr" value="3" min="1" max="10" onchange="invalidatePrepare()">
+              </div>
+              <div>
+                <label for="spoof_ip">IP جعلی مبدا</label>
+                <input type="text" id="spoof_ip" class="ltr" value="8.8.8.8" oninput="invalidatePrepare()">
+              </div>
+              <div id="udp_port_wrap">
+                <label for="udp_port">پورت UDP گیرنده</label>
+                <input type="number" id="udp_port" class="ltr" value="5555" min="1" max="65535" onchange="invalidatePrepare()">
+              </div>
+              <div class="full">
+                <label for="target_ip">مقصد</label>
+                <input type="text" id="target_ip" class="ltr" readonly placeholder="—">
                 <div class="chips">
-                    <span class="chip" onclick="setSpoof('8.8.8.8')">Google DNS (8.8.8.8)</span>
-                    <span class="chip" onclick="setSpoof('1.1.1.1')">Cloudflare (1.1.1.1)</span>
-                    <span class="chip" onclick="setSpoof('9.9.9.9')">Quad9 (9.9.9.9)</span>
+                  <button class="chip" onclick="setSpoof('8.8.8.8')">8.8.8.8</button>
+                  <button class="chip" onclick="setSpoof('1.1.1.1')">1.1.1.1</button>
+                  <button class="chip" onclick="setSpoof('9.9.9.9')">9.9.9.9</button>
                 </div>
-
-                <div class="action-row">
-                    <button id="prep_btn" class="btn-prepare" disabled onclick="prepareReceiver()">
-                        📡 ۱. سرور دوم گوش بدهد (Listen)
-                    </button>
-                    <button id="run_btn" class="btn-primary" disabled onclick="runTest()">
-                        🚀 ۲. ارسال پکت‌های تست (Send)
-                    </button>
-                </div>
-
-                <div id="test_result_box" class="alert-box"></div>
+                <div class="hint" id="port_hint">پورت UDP باید در فایروال سرور گیرنده باز باشد.</div>
+              </div>
             </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">📊 ۲. وضعیت گیرنده و پنجره لاگ زنده</h2>
-                    <span id="local_recv_badge" style="font-size:12px; font-weight:bold; color:var(--text-muted); font-family:monospace;">Local Receiver: IDLE</span>
-                </div>
-
-                <div id="receiver_ready_banner" class="alert-box success">
-                    <strong>🟢 READY — این سرور در حال گوش دادن (Listening) است!</strong>
-                    آماده دریافت پکت‌های تست از سرور مقابل می‌باشد.
-                </div>
-
-                <div class="metrics-grid">
-                    <div class="metric-box">
-                        <div class="m-title">۱. تولید پکت محلی</div>
-                        <div class="m-val" id="m_sent">0</div>
-                    </div>
-                    <div class="metric-box">
-                        <div class="m-title">۲. نصب و شمارنده SNAT</div>
-                        <div class="m-val" id="m_snat" style="color:#facc15;">—</div>
-                    </div>
-                    <div class="metric-box">
-                        <div class="m-title">۳. دریافت واقعی در مقصد</div>
-                        <div class="m-val" id="m_verified" style="color:#4ade80;">0</div>
-                    </div>
-                    <div class="metric-box">
-                        <div class="m-title">۴. نتیجه نهایی اسپوف</div>
-                        <div class="m-val" id="m_class" style="font-size:11px;">NOT_TESTED</div>
-                    </div>
-                </div>
-
-                <div class="terminal-window">
-                    <div class="terminal-bar">
-                        <span style="font-size: 11px; color: #64748b; font-family: monospace;">root@checkspoof:~# live-log</span>
-                        <button class="btn-sm" onclick="clearLogs()">پاکسازی لاگ</button>
-                    </div>
-                    <div id="terminal">System initialized. Waiting for pairing...</div>
-                </div>
-            </div>
+          </div>
         </div>
+
+        <div class="step" id="step3">
+          <div class="num">3</div>
+          <div class="body">
+            <h3>اجرا</h3>
+            <div class="actions">
+              <button id="prep_btn" class="btn" disabled onclick="prepareReceiver()">آماده‌سازی گیرنده</button>
+              <button id="run_btn" class="btn primary" disabled onclick="runTest()">ارسال پکت‌ها</button>
+            </div>
+            <div class="note" id="prep_note"></div>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <script>
-        const ADMIN_KEY = "{{.AdminKey}}";
-        let tokenVisible = true;
+    <div>
+      <section class="card">
+        <h2>نتیجه</h2>
+        <p class="sub">ابتدا پکت کنترلی بدون جعل، سپس پکت‌های جعلی ارسال می‌شوند.</p>
+        <div id="result"><p class="empty">هنوز آزمونی اجرا نشده است.</p></div>
+      </section>
 
-        function apiHeaders() {
-            return {
-                'Content-Type': 'application/json',
-                'X-Admin-Key': ADMIN_KEY
-            };
-        }
+      <section class="card">
+        <div class="logbar">
+          <h2 style="margin:0">گزارش زنده</h2>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span class="listen" id="listen_badge"><span class="dot ok"></span>این سرور در حال گوش دادن است</span>
+            <button class="btn ghost" onclick="clearLogs()">پاک کردن</button>
+          </div>
+        </div>
+        <pre id="terminal">Waiting for pairing…</pre>
+      </section>
+    </div>
+  </div>
+  <p class="foot">Peer ID <span class="mono" id="peer_id">—</span> · Heartbeat <span class="mono" id="hb_badge">—</span> · Peer receiver <span class="mono" id="recv_state_badge">IDLE</span></p>
+</div>
 
-        function toggleToken() {
-            const el = document.getElementById('my_token');
-            const btn = document.getElementById('toggle_btn');
-            tokenVisible = !tokenVisible;
-            el.innerText = tokenVisible ? el.getAttribute('data-token') : '••••••••••••••••••••••••••••••••••••••••••••••••••••';
-            btn.innerText = tokenVisible ? 'مخفی کردن' : 'نمایش';
-        }
+<script>
+const ADMIN_KEY = "{{.AdminKey}}";
+let tokenVisible = true;
+const $ = id => document.getElementById(id);
 
-        function copyTextFallback(text) {
-            const ta = document.createElement('textarea');
-            ta.value = text;
-            ta.setAttribute('readonly', '');
-            ta.style.position = 'fixed';
-            ta.style.top = '-9999px';
-            ta.style.left = '-9999px';
-            document.body.appendChild(ta);
-            ta.focus();
-            ta.select();
-            ta.setSelectionRange(0, text.length);
-            let ok = false;
-            try {
-                ok = document.execCommand('copy');
-            } catch (e) {
-                ok = false;
-            }
-            document.body.removeChild(ta);
-            return ok;
-        }
+function headers(){ return {'Content-Type':'application/json','X-Admin-Key':ADMIN_KEY}; }
+function api(path, body){
+  return fetch(path,{method:'POST',headers:headers(),body:JSON.stringify(body||{})})
+    .then(async r => { if(!r.ok) throw new Error((await r.text()).trim()); const t = await r.text(); return t ? JSON.parse(t) : {}; });
+}
+function note(id, kind, text){ const el=$(id); el.className='note show '+(kind||''); el.textContent=text; }
+function hideNote(id){ $(id).className='note'; }
 
-        function copyToken() {
-            const el = document.getElementById('my_token');
-            const raw = el.getAttribute('data-token');
-            const btn = document.getElementById('copy_btn');
+function toggleToken(){
+  const el=$('my_token'); tokenVisible=!tokenVisible;
+  el.textContent = tokenVisible ? el.getAttribute('data-token') : '••••••••••••••••••••••••••••••••';
+  $('toggle_btn').textContent = tokenVisible ? 'مخفی' : 'نمایش';
+}
+function copyFallback(text){
+  const ta=document.createElement('textarea'); ta.value=text; ta.style.position='fixed'; ta.style.top='-9999px';
+  document.body.appendChild(ta); ta.select(); let ok=false; try{ok=document.execCommand('copy');}catch(e){}
+  document.body.removeChild(ta); return ok;
+}
+function copyToken(){
+  const raw=$('my_token').getAttribute('data-token'), btn=$('copy_btn');
+  const done=()=>{ btn.textContent='کپی شد'; setTimeout(()=>btn.textContent='کپی',1600); };
+  const fb=()=>{ if(copyFallback(raw)) done(); else window.prompt('Copy token:', raw); };
+  if(navigator.clipboard && window.isSecureContext){ navigator.clipboard.writeText(raw).then(done).catch(fb); } else { fb(); }
+}
+function savePublicIP(){
+  api('/api/admin/public-ip',{public_ip:$('manual_public_ip').value.trim()})
+    .then(d=>{ $('public_ip_badge').textContent=d.public_ip; const el=$('my_token'); el.setAttribute('data-token',d.pairing_token); if(tokenVisible) el.textContent=d.pairing_token; note('pubip_note','ok','IP عمومی و توکن به‌روزرسانی شد.'); })
+    .catch(e=>note('pubip_note','bad',e.message));
+}
+function setSpoof(ip){ $('spoof_ip').value=ip; invalidatePrepare(); }
+function onTypeChange(){
+  const udp=$('test_type').value==='udp';
+  $('udp_port_wrap').style.display = udp ? '' : 'none';
+  $('port_hint').textContent = udp ? 'پورت UDP باید در فایروال سرور گیرنده باز باشد.' : 'ICMP روی سوکت خام دریافت می‌شود و پورت لازم ندارد.';
+  invalidatePrepare();
+}
+function invalidatePrepare(){ $('run_btn').disabled=true; }
+function clearLogs(){ api('/api/admin/clear-logs').catch(()=>{}); }
 
-            const markCopied = () => {
-                btn.innerText = 'کپی شد ✓';
-                btn.style.borderColor = '#22c55e';
-                btn.style.color = '#4ade80';
-                setTimeout(() => {
-                    btn.innerText = 'کپی توکن';
-                    btn.style.borderColor = '#334155';
-                    btn.style.color = '#f8fafc';
-                }, 2000);
-            };
+function setStep(n){
+  [1,2,3].forEach(i=>{ const s=$('step'+i); s.classList.toggle('done', i<n); s.classList.toggle('active', i===n); });
+}
 
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(raw).then(markCopied).catch(() => {
-                    if (copyTextFallback(raw)) {
-                        markCopied();
-                    } else {
-                        window.prompt('توکن را با Ctrl+C کپی کنید:', raw);
-                    }
-                });
-            } else {
-                if (copyTextFallback(raw)) {
-                    markCopied();
-                } else {
-                    window.prompt('توکن را با Ctrl+C کپی کنید:', raw);
-                }
-            }
-        }
+function poll(){
+  fetch('/api/admin/status',{headers:headers()}).then(r=>r.json()).then(d=>{
+    const connected = d.conn_state==='CONNECTED';
+    $('conn_state_badge').textContent=d.conn_state;
+    $('conn_dot').className='dot '+(connected?'ok':(d.conn_state==='ERROR'?'bad':''));
+    $('recv_state_badge').textContent=d.peer_receiver_state||'—';
+    $('hb_badge').textContent=d.last_heartbeat;
+    $('peer_id').textContent=d.peer_id;
+    $('local_ip_badge').textContent=d.local_outbound_ip;
+    $('public_ip_badge').textContent=d.public_ip;
+    $('listen_badge').classList.toggle('show', d.local_receiver_state==='READY_TO_RECEIVE'||d.local_receiver_state==='TEST_RUNNING');
+    if(d.peer_ip && d.peer_ip!=='—') $('target_ip').value=d.peer_ip;
+    $('prep_btn').disabled=!connected;
+    const ready = connected && d.peer_receiver_state==='READY_TO_RECEIVE' && d.prepared_session_id;
+    $('run_btn').disabled=!ready;
+    setStep(!connected ? 1 : (ready ? 3 : 2));
+    if(d.logs && d.logs.length){
+      const term=$('terminal'), joined=d.logs.join('\n');
+      if(term.textContent!==joined){ const atEnd = term.scrollHeight-term.scrollTop-term.clientHeight<40; term.textContent=joined; if(atEnd) term.scrollTop=term.scrollHeight; }
+    }
+  }).catch(()=>{});
+}
+setInterval(poll,1200); poll();
 
-        function savePublicIP() {
-            const ip = document.getElementById('manual_public_ip').value.trim();
-            fetch('/api/admin/public-ip', {
-                method: 'POST',
-                headers: apiHeaders(),
-                body: JSON.stringify({ public_ip: ip })
-            })
-            .then(async r => {
-                if (!r.ok) throw new Error(await r.text());
-                return r.json();
-            })
-            .then(d => {
-                document.getElementById('public_ip_badge').innerText = d.public_ip + " (" + d.public_ip_source + ")";
-                const el = document.getElementById('my_token');
-                el.setAttribute('data-token', d.pairing_token);
-                if (tokenVisible) el.innerText = d.pairing_token;
-                alert('آدرس IP عمومی و توکن جفت‌سازی به‌روزرسانی شد.');
-            })
-            .catch(err => alert('خطا: ' + err.message));
-        }
+function pairServer(){
+  const token=$('remote_token').value.trim();
+  if(!token){ note('pair_alert','warn','توکن سرور گیرنده را وارد کنید.'); return; }
+  const btn=$('pair_btn'); btn.disabled=true; note('pair_alert','','در حال اتصال امن…');
+  api('/api/admin/pair',{remote_token:token})
+    .then(d=>{ $('target_ip').value=d.peer_ip; $('prep_btn').disabled=false; note('pair_alert','ok','متصل شد به '+d.peer_ip); })
+    .catch(e=>note('pair_alert','bad',e.message))
+    .finally(()=>btn.disabled=false);
+}
 
-        function setSpoof(ip) {
-            document.getElementById('spoof_ip').value = ip;
-            invalidatePrepare();
-        }
+function prepareReceiver(){
+  const body={
+    spoof_ip:$('spoof_ip').value.trim(),
+    test_type:$('test_type').value,
+    packet_count:parseInt($('packet_count').value,10)||3
+  };
+  if(body.test_type==='udp') body.udp_port=parseInt($('udp_port').value,10)||5555;
+  const btn=$('prep_btn'); btn.disabled=true; note('prep_note','','در حال آماده‌سازی گیرنده…');
+  api('/api/admin/prepare',body)
+    .then(d=>{ $('run_btn').disabled=false; note('prep_note','ok','گیرنده آماده است'+(d.udp_port && body.test_type==='udp' ? ' (UDP '+d.udp_port+')' : '')+'. حالا پکت‌ها را ارسال کنید.'); })
+    .catch(e=>note('prep_note','bad',e.message))
+    .finally(()=>btn.disabled=false);
+}
 
-        function invalidatePrepare() {
-            document.getElementById('run_btn').disabled = true;
-        }
-
-        function clearLogs() {
-            fetch('/api/admin/clear-logs', { method: 'POST', headers: apiHeaders() });
-        }
-
-        setInterval(() => {
-            fetch('/api/admin/status', { headers: apiHeaders() })
-            .then(r => r.json())
-            .then(d => {
-                document.getElementById('conn_state_badge').innerText = d.conn_state;
-                const peerLabel = (d.peer_receiver_state === "READY_TO_RECEIVE") ? "🟢 READY (در حال گوش دادن)" : d.peer_receiver_state;
-                document.getElementById('recv_state_badge').innerText = peerLabel;
-                document.getElementById('hb_badge').innerText = d.last_heartbeat;
-                document.getElementById('local_ip_badge').innerText = d.local_outbound_ip;
-                document.getElementById('public_ip_badge').innerText = d.public_ip + " (" + d.public_ip_source + ")";
-
-                const localBadge = document.getElementById('local_recv_badge');
-                const readyBanner = document.getElementById('receiver_ready_banner');
-                if (d.local_receiver_state === "READY_TO_RECEIVE" || d.local_receiver_state === "TEST_RUNNING") {
-                    localBadge.innerText = "🟢 READY (در حال گوش دادن)";
-                    localBadge.style.color = "#4ade80";
-                    readyBanner.className = "alert-box success show";
-                } else {
-                    localBadge.innerText = "Local Receiver: " + d.local_receiver_state;
-                    localBadge.style.color = "#94a3b8";
-                    readyBanner.className = "alert-box success";
-                }
-
-                if (d.peer_ip && d.peer_ip !== "—") {
-                    document.getElementById('target_ip').value = d.peer_ip;
-                }
-
-                const prepBtn = document.getElementById('prep_btn');
-                const runBtn = document.getElementById('run_btn');
-                prepBtn.disabled = (d.conn_state !== "CONNECTED");
-                runBtn.disabled = !(d.conn_state === "CONNECTED" && d.peer_receiver_state === "READY_TO_RECEIVE" && d.prepared_session_id);
-
-                if (d.logs && d.logs.length > 0) {
-                    const term = document.getElementById('terminal');
-                    const joined = d.logs.join("\n");
-                    if (term.innerText !== joined) {
-                        term.innerText = joined;
-                        term.scrollTop = term.scrollHeight;
-                    }
-                }
-            }).catch(() => {});
-        }, 1200);
-
-        function pairServer() {
-            const token = document.getElementById('remote_token').value.trim();
-            const alertBox = document.getElementById('pair_alert');
-            const btn = document.getElementById('pair_btn');
-            if (!token) { alert('لطفاً توکن سرور دوم را وارد کنید'); return; }
-
-            btn.disabled = true;
-            alertBox.className = 'alert-box warning show';
-            alertBox.innerHTML = '<strong>⏳ در حال اتصال امن TLS 1.3 به سرور دوم...</strong>';
-
-            fetch('/api/admin/pair', {
-                method: 'POST',
-                headers: apiHeaders(),
-                body: JSON.stringify({ remote_token: token })
-            })
-            .then(async r => {
-                if (!r.ok) throw new Error(await r.text());
-                return r.json();
-            })
-            .then(d => {
-                document.getElementById('target_ip').value = d.peer_ip;
-                document.getElementById('prep_btn').disabled = false;
-                alertBox.className = 'alert-box success show';
-                alertBox.innerHTML = '<strong>✅ اتصال برقرار شد!</strong>سرور دوم (<code>' + d.peer_ip + '</code>) متصل است. اکنون دکمه <b>«📡 ۱. سرور دوم گوش بدهد (Listen)»</b> را بزنید.';
-            })
-            .catch(err => {
-                alertBox.className = 'alert-box failure show';
-                alertBox.innerHTML = '<strong>❌ خطا در اتصال</strong>' + err.message;
-            })
-            .finally(() => {
-                btn.disabled = false;
-            });
-        }
-
-        function prepareReceiver() {
-            const spoof = document.getElementById('spoof_ip').value.trim();
-            const testType = document.getElementById('test_type').value;
-            const count = parseInt(document.getElementById('packet_count').value, 10) || 3;
-            const resBox = document.getElementById('test_result_box');
-            const prepBtn = document.getElementById('prep_btn');
-
-            prepBtn.disabled = true;
-            resBox.className = 'alert-box warning show';
-            resBox.innerHTML = '<strong>⏳ در حال قرار دادن سرور دوم در حالت گوش دادن (Listen)...</strong>';
-
-            fetch('/api/admin/prepare', {
-                method: 'POST',
-                headers: apiHeaders(),
-                body: JSON.stringify({ spoof_ip: spoof, test_type: testType, packet_count: count })
-            })
-            .then(async r => {
-                if (!r.ok) throw new Error(await r.text());
-                return r.json();
-            })
-            .then(d => {
-                document.getElementById('run_btn').disabled = false;
-                resBox.className = 'alert-box success show';
-                resBox.innerHTML = '<strong>🟢 سرور دوم هم‌اکنون در حال گوش دادن است (READY) و این سرور آماده ارسال پکت است!</strong>اکنون دکمه <b>«🚀 ۲. ارسال پکت‌های تست (Send)»</b> را بزنید.';
-            })
-            .catch(err => {
-                resBox.className = 'alert-box failure show';
-                resBox.innerHTML = '<strong>❌ خطا در فعال‌سازی گیرنده</strong>' + err.message;
-            })
-            .finally(() => {
-                prepBtn.disabled = false;
-            });
-        }
-
-        function runTest() {
-            const runBtn = document.getElementById('run_btn');
-            const resBox = document.getElementById('test_result_box');
-            runBtn.disabled = true;
-            resBox.className = 'alert-box warning show';
-            resBox.innerHTML = '<strong>🚀 در حال ارسال پکت‌های اسپوف‌شده به سرور دوم...</strong>';
-
-            fetch('/api/admin/test', {
-                method: 'POST',
-                headers: apiHeaders(),
-                body: JSON.stringify({})
-            })
-            .then(async r => {
-                if (!r.ok) throw new Error(await r.text());
-                return r.json();
-            })
-            .then(d => {
-                document.getElementById('m_sent').innerText = (d.local_packet_gen_success ? "OK " : "FAIL ") + "(" + d.packets_sent + "/" + d.packets_attempted + ")";
-                document.getElementById('m_snat').innerText = (d.snat_rule_installed ? "INSTALLED " : "FAIL ") + "(" + d.snat_packets_matched + " pkts)";
-                document.getElementById('m_verified').innerText = d.remote_verified_count + (d.remote_spoof_verified ? " (SPOOFED)" : "");
-                document.getElementById('m_class').innerText = d.primary_classification;
-
-                resBox.className = 'alert-box show ' + (d.status_class || 'failure');
-                resBox.innerHTML = '<strong>' + d.result_title + ' [' + d.primary_classification + ']</strong>' +
-                    '<div style="margin-top:6px;"><b>مراحل ثبت‌شده:</b> <code>' + (d.classifications || []).join(' → ') + '</code></div>' +
-                    '<div style="margin-top:4px;">' + d.confirmed_evidence + '</div>' +
-                    '<div style="margin-top:4px; opacity:0.9;">' + d.possible_explanations + '</div>';
-            })
-            .catch(err => {
-                resBox.className = 'alert-box show failure';
-                resBox.innerHTML = '<strong>❌ خطا در اجرای تست</strong>' + err.message;
-            });
-        }
-    </script>
+function el(tag, cls, text){ const e=document.createElement(tag); if(cls) e.className=cls; if(text!==undefined) e.textContent=text; return e; }
+function stageRow(label, ok, value){
+  const li=el('li'); const s=el('span','s'); s.appendChild(el('span','dot '+(ok===true?'ok':ok===false?'bad':'')));
+  s.appendChild(el('span','',label)); li.appendChild(s); li.appendChild(el('span','v',value)); return li;
+}
+function renderResult(d){
+  const box=$('result'); box.innerHTML='';
+  const kind=d.status_class||'failure';
+  const v=el('div','verdict '+kind);
+  v.appendChild(el('div','badge', kind==='success'?'✓':(kind==='warning'?'!':'×')));
+  const t=el('div'); t.appendChild(el('h3','',String(d.result_title||'').replace(/^[^\p{L}\p{N}]+/u,''))); t.appendChild(el('div','cls',d.primary_classification)); v.appendChild(t);
+  box.appendChild(v);
+  const ul=el('ul','stages');
+  const ctlOk = d.control_packets_sent ? d.control_received_count>0 : null;
+  ul.appendChild(stageRow('مسیر کنترلی (بدون جعل)', ctlOk, (d.control_received_count||0)+'/'+(d.control_packets_sent||0)+(d.control_observed_ip?'  '+d.control_observed_ip:'')));
+  ul.appendChild(stageRow('قانون SNAT', d.snat_rule_installed, d.isolated_chain_name||'—'));
+  ul.appendChild(stageRow('ارسال محلی', d.local_packet_gen_success, d.packets_sent+'/'+d.packets_attempted));
+  ul.appendChild(stageRow('تطابق در کرنل', d.snat_packets_matched>0, d.snat_packets_matched+' pkts'));
+  ul.appendChild(stageRow('دریافت با IP جعلی', d.remote_spoof_verified, String(d.remote_verified_count)));
+  box.appendChild(ul);
+  const det=el('div','detail'); det.appendChild(el('p','',d.confirmed_evidence)); det.appendChild(el('p','',d.possible_explanations)); box.appendChild(det);
+}
+function runTest(){
+  const btn=$('run_btn'); btn.disabled=true;
+  $('result').innerHTML=''; $('result').appendChild(el('p','empty','در حال ارسال پکت کنترلی و پکت‌های جعلی…'));
+  api('/api/admin/test',{}).then(renderResult).catch(e=>{ $('result').innerHTML=''; renderResult({status_class:'failure',result_title:'خطا در اجرای آزمون',primary_classification:'ERROR',confirmed_evidence:e.message,possible_explanations:'',packets_sent:0,packets_attempted:0,snat_packets_matched:0,remote_verified_count:0}); });
+}
+onTypeChange();
+</script>
 </body>
 </html>
 `
@@ -3687,6 +3753,7 @@ func main() {
 	spoofIPFlag := flag.String("spoof-ip", "8.8.8.8", "Spoofed source IPv4 address for -integration-peer mode")
 	methodFlag := flag.String("method", "udp", "Test method for -integration-peer mode (udp or icmp)")
 	countFlag := flag.Int("count", 3, "Packet count for -integration-peer mode (1..10)")
+	udpPortFlag := flag.Int("udp-port", DefaultUDPPort, "Receiver UDP port for -integration-peer mode (must be open on Server B)")
 	flag.Parse()
 
 	srv, err := NewAppServer(&RealCommandRunner{})
@@ -3723,7 +3790,7 @@ func main() {
 		fmt.Printf("🎭 Spoof Source IP   : %s\n", *spoofIPFlag)
 		fmt.Println("======================================================================")
 
-		res, runErr := srv.RunRealVPSIntegrationTest(ctx, *integrationPeer, *spoofIPFlag, *methodFlag, *countFlag)
+		res, runErr := srv.RunRealVPSIntegrationTest(ctx, *integrationPeer, *spoofIPFlag, *methodFlag, *countFlag, *udpPortFlag)
 		if runErr != nil {
 			fmt.Printf("[-] Integration test execution failed: %v\n", runErr)
 			os.Exit(1)
@@ -3732,6 +3799,7 @@ func main() {
 		fmt.Printf("1. Receiver Listener Ready : %v\n", res.ReceiverListenerReady)
 		fmt.Printf("2. SNAT Rule Installed     : %v (Chain: %s, Outgoing Iface: %s, Outgoing Src: %s)\n", res.SNATRuleInstalled, res.IsolatedChainName, res.OutgoingInterface, res.OutgoingSourceIP)
 		fmt.Printf("3. Local Packet Generation : %v (%d/%d packets sent)\n", res.LocalPacketGenSuccess, res.PacketsSent, res.PacketsAttempted)
+		fmt.Printf("0. Control Path Check      : %d/%d unspoofed packets arrived (seen as %s)\n", res.ControlReceivedCount, res.ControlPacketsSent, res.ControlObservedIP)
 		fmt.Printf("4. Local SNAT Rule Matched : %d packets (%d bytes)\n", res.SNATPacketsMatched, res.SNATBytesMatched)
 		fmt.Printf("5. Remote Spoof Verified   : %v (%d verified packets with spoofed IP %s)\n", res.RemoteSpoofVerified, res.RemoteVerifiedCount, *spoofIPFlag)
 		fmt.Printf("🏁 Final Classification    : %s\n", res.PrimaryClassification)
@@ -3739,6 +3807,9 @@ func main() {
 
 		if res.PrimaryClassification == ClassSpoofSuccess && res.RemoteSpoofVerified {
 			os.Exit(0)
+		}
+		if res.PrimaryClassification == ClassControlPathBlocked {
+			os.Exit(3)
 		}
 		os.Exit(2)
 	}
