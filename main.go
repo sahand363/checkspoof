@@ -294,6 +294,10 @@ var journalFileMu sync.Mutex
 type AppServer struct {
 	prepMu sync.Mutex
 
+	// PanelTLS forces the browser panel onto HTTPS. Off by default: the panel
+	// is served over plain HTTP (the server-to-server channel is always TLS 1.3).
+	PanelTLS bool
+
 	mu                sync.RWMutex
 	ServerID          string
 	InstanceChainID   string
@@ -3531,6 +3535,7 @@ func (s *AppServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 				Value:    s.AdminKey,
 				Path:     "/",
 				HttpOnly: true,
+				Secure:   r.TLS != nil,
 				SameSite: http.SameSiteStrictMode,
 			})
 		}
@@ -3777,7 +3782,35 @@ func (s *AppServer) Routes() http.Handler {
 	mux.HandleFunc("/api/peer/prepare", s.requirePeerTLSAuth(s.handlePeerPrepare))
 	mux.HandleFunc("/api/peer/results", s.requirePeerTLSAuth(s.handlePeerResults))
 
-	return mux
+	return s.panelSchemeGuard(mux)
+}
+
+// panelSchemeGuard sends plain-HTTP browser requests to HTTPS when panel SSL
+// is on. Peer endpoints already reject non-TLS requests on their own.
+func (s *AppServer) panelSchemeGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.PanelTLS && r.TLS == nil && !strings.HasPrefix(r.URL.Path, "/api/peer/") {
+			http.Redirect(w, r, "https://"+r.Host+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// PanelScheme is the scheme the panel link should use.
+func (s *AppServer) PanelScheme() string {
+	if s.PanelTLS {
+		return "https"
+	}
+	return "http"
+}
+
+func parseBoolEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func (s *AppServer) Shutdown() {
@@ -3798,6 +3831,7 @@ func main() {
 	udpPortFlag := flag.Int("udp-port", DefaultUDPPort, "Receiver UDP port for -integration-peer mode (must be open on Server B)")
 	adminKeyFlag := flag.String("admin-key", "", "Fixed admin access key (16+ chars of A-Z a-z 0-9 - _); also read from CHECKSPOOF_ADMIN_KEY")
 	versionFlag := flag.Bool("version", false, "Print the version and exit")
+	panelTLSFlag := flag.Bool("panel-tls", false, "Serve the browser panel over HTTPS only (self-signed); also CHECKSPOOF_PANEL_TLS=1")
 	flag.Parse()
 
 	if *versionFlag || (flag.NArg() > 0 && flag.Arg(0) == "version") {
@@ -3822,6 +3856,7 @@ func main() {
 		}
 		srv.AdminKey = fixedKey
 	}
+	srv.PanelTLS = *panelTLSFlag || parseBoolEnv(os.Getenv("CHECKSPOOF_PANEL_TLS"))
 
 	recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = srv.RecoverOrphanedChainsFromJournal(recCtx)
@@ -3900,8 +3935,12 @@ func main() {
 	fmt.Printf("🆔 Server ID         : %s (Chain Prefix: CSPF_%s_*)\n", srv.ServerID, srv.InstanceChainID)
 	fmt.Printf("📍 Local Outbound IP : %s (Interface: %s)\n", srv.LocalOutboundIP, srv.LocalInterface)
 	fmt.Printf("🌐 Public IP         : %s (Source: %s, Behind NAT: %v)\n", srv.PublicIP, srv.PublicIPSource, srv.BehindNAT)
-	fmt.Printf("🌐 Dashboard Login   : https://%s:%s/?key=%s\n", ctrlIP, srv.Port, srv.AdminKey)
-	fmt.Printf("🌐 HTTP Fallback     : http://%s:%s/?key=%s\n", ctrlIP, srv.Port, srv.AdminKey)
+	fmt.Printf("🌐 Dashboard Login   : %s://%s:%s/?key=%s\n", srv.PanelScheme(), ctrlIP, srv.Port, srv.AdminKey)
+	if srv.PanelTLS {
+		fmt.Println("🔒 Panel SSL         : on (self-signed; plain HTTP redirects to HTTPS)")
+	} else {
+		fmt.Println("🔓 Panel SSL         : off (plain HTTP; turn on with -panel-tls)")
+	}
 	fmt.Printf("🔑 Admin Access Key  : %s\n", srv.AdminKey)
 	fmt.Printf("🔗 Pairing Token     : %s\n", srv.PairingToken())
 	fmt.Println("======================================================================")

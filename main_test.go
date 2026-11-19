@@ -1366,3 +1366,39 @@ func TestRegression_OldSessionCleanupCannotOverwriteNewSessionState(t *testing.T
 		t.Fatalf("old session cleanup overwrote ActiveRecvSession pointer")
 	}
 }
+
+func TestPanelSchemeGuard(t *testing.T) {
+	srv, err := NewAppServer(&MockCommandRunner{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Shutdown()
+	h := srv.Routes()
+
+	// SSL off (default): plain HTTP serves the panel (login page, 401).
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://203.0.113.5:8085/", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("ssl off: want 401 login page, got %d", rec.Code)
+	}
+	if srv.PanelScheme() != "http" {
+		t.Fatalf("ssl off: scheme %q", srv.PanelScheme())
+	}
+
+	// SSL on: plain HTTP browser requests redirect to HTTPS.
+	srv.PanelTLS = true
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://203.0.113.5:8085/?key=abc", nil))
+	if rec.Code != http.StatusTemporaryRedirect || rec.Header().Get("Location") != "https://203.0.113.5:8085/?key=abc" {
+		t.Fatalf("ssl on: want redirect, got %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	// Peer endpoints are never redirected; they reject non-TLS themselves.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://203.0.113.5:8085/api/peer/heartbeat", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("peer over http: want 403, got %d", rec.Code)
+	}
+	if !parseBoolEnv("on") || !parseBoolEnv("1") || parseBoolEnv("") || parseBoolEnv("0") {
+		t.Fatal("parseBoolEnv")
+	}
+}

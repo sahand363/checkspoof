@@ -53,6 +53,7 @@ mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
 touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
 grep -q '^CHECKSPOOF_PORT=' "$ENV_FILE" || echo "CHECKSPOOF_PORT=${CHECKSPOOF_PORT:-8085}" >> "$ENV_FILE"
 grep -q '^CHECKSPOOF_ADMIN_KEY=' "$ENV_FILE" || echo "CHECKSPOOF_ADMIN_KEY=$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$ENV_FILE"
+grep -q '^CHECKSPOOF_PANEL_TLS=' "$ENV_FILE" || echo "CHECKSPOOF_PANEL_TLS=0" >> "$ENV_FILE"
 PORT=$(grep -m1 '^CHECKSPOOF_PORT=' "$ENV_FILE" | cut -d= -f2)
 
 cat > "$SERVICE" <<UNIT

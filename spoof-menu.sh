@@ -4,6 +4,7 @@
 #   sudo spoof update     update to the latest release
 #   sudo spoof rollback   go back to the previous version
 #   sudo spoof link       print the panel link
+#   sudo spoof ssl on|off serve the panel over HTTPS or plain HTTP
 set -Eeuo pipefail
 
 APP=checkspoof
@@ -77,7 +78,9 @@ public_ip(){
   echo "${ip:-SERVER-IP}"
 }
 
-panel_link(){ echo "https://$(public_ip):$(panel_port)/?key=$(getv CHECKSPOOF_ADMIN_KEY)"; }
+ssl_on(){ [[ "$(getv CHECKSPOOF_PANEL_TLS | tr 'A-Z' 'a-z')" =~ ^(1|true|yes|on)$ ]]; }
+panel_scheme(){ if ssl_on; then echo https; else echo http; fi; }
+panel_link(){ echo "$(panel_scheme)://$(public_ip):$(panel_port)/?key=$(getv CHECKSPOOF_ADMIN_KEY)"; }
 
 svc_state(){ systemctl is-active "$APP" 2>/dev/null || true; }
 
@@ -105,7 +108,8 @@ header(){
   if [[ "${INSTALLED_NOW:-0}" == "1" ]]; then
     echo "  ${G}${B}Installed and running.${N}"
   fi
-  echo "  ${D}Panel ${N}  ${A}$(panel_link)${N}"
+  local sslnote="${D}(SSL off)${N}"; ssl_on && sslnote="${D}(SSL on)${N}"
+  echo "  ${D}Panel ${N}  ${A}$(panel_link)${N}  $sslnote"
   echo "  ${D}Menu  ${N}  ${B}sudo spoof${N}   ${D}·  update: ${N}sudo spoof update"
   echo "  ${D}─────────────────────────────────────────────────────────────${N}"
   echo
@@ -185,12 +189,15 @@ rollback_app(){
 show_access(){
   local ip port key
   ip=$(public_ip); port=$(panel_port); key=$(getv CHECKSPOOF_ADMIN_KEY)
-  echo "  ${B}Panel (HTTPS)${N}   ${A}https://$ip:$port/?key=$key${N}"
-  echo "  ${B}Panel (HTTP)${N}    ${D}http://$ip:$port/?key=$key${N}"
+  echo "  ${B}Panel${N}           ${A}$(panel_scheme)://$ip:$port/?key=$key${N}"
   echo "  ${B}Admin key${N}       $key"
   echo "  ${B}UDP test port${N}   ${D}set per test in the panel (default 5555); open it on Server B${N}"
   echo
-  echo "  ${D}The certificate is self-signed, so the browser shows a warning once.${N}"
+  if ssl_on; then
+    echo "  ${D}SSL is on. The certificate is self-signed, so the browser shows a warning once.${N}"
+  else
+    echo "  ${D}SSL is off: plain HTTP, fine for a quick test. Turn it on from the menu if you keep it running.${N}"
+  fi
   echo "  ${D}The pairing token is shown inside the panel.${N}"
 }
 
@@ -239,6 +246,27 @@ set_public_ip(){
   health_ok && ok "Saved." || err "Service did not come up."
 }
 
+set_ssl(){
+  # $1 = on|off, or empty to flip the current setting
+  local want="${1:-}"
+  if [[ -z "$want" ]]; then ssl_on && want=off || want=on; fi
+  case "$want" in
+    on)  setv CHECKSPOOF_PANEL_TLS 1 ;;
+    off) setv CHECKSPOOF_PANEL_TLS 0 ;;
+    *)   err "Use: sudo spoof ssl on|off"; return 1 ;;
+  esac
+  if [[ "$(svc_state)" == "active" ]]; then
+    systemctl restart "$APP"
+    health_ok || { err "Service did not come up."; return 1; }
+  fi
+  if [[ "$want" == on ]]; then
+    ok "Panel SSL is on. Plain HTTP now redirects to HTTPS (self-signed certificate)."
+  else
+    ok "Panel SSL is off. The panel is plain HTTP."
+  fi
+  echo "  ${D}Panel${N}  ${A}$(panel_link)${N}"
+}
+
 toggle_service(){
   if [[ "$(svc_state)" == "active" ]]; then
     systemctl stop "$APP" && ok "Stopped. Owned firewall chains were cleaned up."
@@ -280,16 +308,18 @@ case "${1:-}" in
   update|--update)     update_app "${2:-}"; exit $? ;;
   rollback|--rollback) rollback_app; exit $? ;;
   link)                panel_link; exit 0 ;;
+  ssl)                 set_ssl "${2:-}"; exit $? ;;
   version|-v)          version_of "$BIN"; exit 0 ;;
   uninstall)           uninstall_app ;;
   "") ;;
-  *) echo "Usage: sudo spoof [update|rollback|link|version|uninstall]"; exit 1 ;;
+  *) echo "Usage: sudo spoof [update|rollback|link|ssl on|off|version|uninstall]"; exit 1 ;;
 esac
 
 while true; do
   header
   INSTALLED_NOW=0
   if [[ "$(svc_state)" == "active" ]]; then toggle="Stop service"; else toggle="Start service"; fi
+  if ssl_on; then sslitem="Panel SSL: ${G}on${N}  ${D}(switch to plain HTTP)${N}"; else sslitem="Panel SSL: ${D}off${N}  ${D}(switch to HTTPS)${N}"; fi
   cat <<EOF
   ${A}1${N}  Update to latest version
   ${A}2${N}  Roll back to previous version
@@ -297,10 +327,11 @@ while true; do
   ${A}4${N}  Change panel port
   ${A}5${N}  Reset admin key
   ${A}6${N}  Set public IP manually
-  ${A}7${N}  Restart service
-  ${A}8${N}  $toggle
-  ${A}9${N}  Live logs  ${D}(Ctrl+C to leave)${N}
-  ${R}10${N} Uninstall
+  ${A}7${N}  $sslitem
+  ${A}8${N}  Restart service
+  ${A}9${N}  $toggle
+  ${A}10${N} Live logs  ${D}(Ctrl+C to leave)${N}
+  ${R}11${N} Uninstall
   ${D}0${N}  Exit
 EOF
   echo
@@ -313,10 +344,11 @@ EOF
     4) change_port || true; pause ;;
     5) reset_key || true; pause ;;
     6) set_public_ip || true; pause ;;
-    7) systemctl restart "$APP"; health_ok && ok "Restarted." || err "Service did not come up."; pause ;;
-    8) toggle_service || true; pause ;;
-    9) journalctl -u "$APP" -f -n 50 || true ;;
-    10) uninstall_app ;;
+    7) set_ssl || true; pause ;;
+    8) systemctl restart "$APP"; health_ok && ok "Restarted." || err "Service did not come up."; pause ;;
+    9) toggle_service || true; pause ;;
+    10) journalctl -u "$APP" -f -n 50 || true ;;
+    11) uninstall_app ;;
     0|q|Q) exit 0 ;;
     *) ;;
   esac
