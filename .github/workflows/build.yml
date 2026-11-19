@@ -20,9 +20,15 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Format Go Code (gofmt)
+      - name: Check Go formatting (gofmt)
         run: |
-          gofmt -s -w .
+          out=$(gofmt -s -l .)
+          if [ -n "$out" ]; then echo "Not gofmt-formatted:"; echo "$out"; exit 1; fi
+
+      - name: Check shell scripts
+        run: |
+          bash -n install.sh
+          bash -n spoof-menu.sh
 
       - name: Run Static Analysis (go vet)
         run: |
@@ -32,15 +38,25 @@ jobs:
         run: |
           go test -v -race ./...
 
-      - name: Build Production Binary
+      - name: Build Release Binaries
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -o checkspoof main.go
+          VERSION=2.0.${{ github.run_number }}
+          LDFLAGS="-s -w -X main.Version=${VERSION}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o checkspoof .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o checkspoof-arm64 .
+          ./checkspoof -version
+          sha256sum checkspoof checkspoof-arm64 spoof-menu.sh > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v2.0.${{ github.run_number }}
           name: CheckSpoof Enterprise v2.0.${{ github.run_number }}
-          files: checkspoof
+          files: |
+            checkspoof
+            checkspoof-arm64
+            spoof-menu.sh
+            SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

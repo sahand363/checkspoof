@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +83,22 @@ const (
 
 // DefaultUDPPort is the receiver UDP port used when none is configured.
 const DefaultUDPPort = 5555
+
+// Version is stamped at build time (-ldflags "-X main.Version=2.0.N").
+var Version = "dev"
+
+// validAdminKey accepts a persisted admin key: 16..128 chars of [A-Za-z0-9_-].
+func validAdminKey(k string) bool {
+	if len(k) < 16 || len(k) > 128 {
+		return false
+	}
+	for _, c := range k {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
 
 // Packet frame markers: spoofed test frames vs. unspoofed control (baseline) frames.
 const (
@@ -3128,6 +3145,7 @@ type DashboardData struct {
 	CertFingerprint string
 	PairingToken    string
 	AdminKey        string
+	Version         string
 }
 
 const dashboardHTML = `<!DOCTYPE html>
@@ -3158,6 +3176,7 @@ body{font-family:'Vazirmatn',system-ui,-apple-system,sans-serif;font-size:14px;l
 .logo svg{width:18px;height:18px}
 .brand h1{margin:0;font-size:17px;font-weight:700;letter-spacing:-.01em}
 .brand p{margin:0;color:var(--faint);font-size:12px}
+.brand .ver{font-size:11px;font-weight:600;color:var(--accent,#a78bfa);background:rgba(167,139,250,.12);border-radius:6px;padding:2px 7px;margin-inline-start:6px;vertical-align:middle;direction:ltr;display:inline-block}
 .status{display:flex;gap:8px;flex-wrap:wrap}
 .tag{display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border:1px solid var(--line);border-radius:999px;font-size:12px;color:var(--muted);background:var(--surface)}
 .tag b{color:var(--text);font-weight:500;font-family:var(--mono);font-size:11.5px}
@@ -3243,7 +3262,7 @@ input[readonly]{color:var(--muted)}
     <div class="brand">
       <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
       <div>
-        <h1>CheckSpoof</h1>
+        <h1>CheckSpoof <span class="ver">v{{.Version}}</span></h1>
         <p>آزمون جعل آدرس مبدا بین دو سرور</p>
       </div>
     </div>
@@ -3491,6 +3510,17 @@ onTypeChange();
 </html>
 `
 
+const loginHTML = `<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CheckSpoof</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net"><link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0b0f;color:#ededf0;font-family:Vazirmatn,system-ui,sans-serif;padding:20px}
+form{width:100%;max-width:360px;background:#131318;border:1px solid #23232b;border-radius:16px;padding:28px}
+h3{margin:0 0 6px;font-size:18px}p{margin:0 0 18px;color:#8b8b96;font-size:13px;line-height:1.7}
+input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid #2a2a33;background:#0b0b0f;color:#fff;font-size:14px;direction:ltr;outline:none;margin-bottom:12px}
+input:focus{border-color:#a78bfa}button{width:100%;padding:12px;border:0;border-radius:10px;background:#a78bfa;color:#0b0b0f;font-weight:700;font-size:14px;font-family:inherit;cursor:pointer}
+code{direction:ltr;display:inline-block;background:#1c1c23;padding:1px 6px;border-radius:5px;color:#c4b5fd}</style></head>
+<body><form method="GET" action="/"><h3>ورود به CheckSpoof</h3><p>کلید مدیریت را وارد کنید. آن را در منوی SSH با دستور <code>sudo spoof</code> می‌بینید.</p>
+<input name="key" type="password" placeholder="Admin Access Key" autocomplete="current-password" autofocus><button type="submit">ورود</button></form></body></html>`
+
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(dashboardHTML))
 
 func (s *AppServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -3514,7 +3544,7 @@ func (s *AppServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("key")), []byte(s.AdminKey)) != 1 {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html lang="fa" dir="rtl"><body style="background:#070b14;color:#f8fafc;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;"><form method="GET" action="/" style="background:#0f172a;padding:28px;border-radius:12px;border:1px solid #1e293b;width:360px;"><h3 style="margin-top:0;color:#38bdf8;">🔒 ورود به داشبورد CheckSpoof</h3><p style="font-size:12px;color:#94a3b8;">کلید دسترسی مدیریت (چاپ‌شده در ترمینال سرور) را وارد کنید:</p><input name="key" type="password" placeholder="Admin Access Key" style="width:100%%;padding:10px;border-radius:8px;border:1px solid #334155;background:#090e1a;color:#fff;box-sizing:border-box;margin-bottom:12px;direction:ltr;"><button type="submit" style="width:100%%;padding:10px;background:#0284c7;color:#fff;border:none;border-radius:8px;font-weight:bold;cursor:pointer;">ورود</button></form></body></html>`)
+		_, _ = io.WriteString(w, loginHTML)
 		return
 	}
 
@@ -3533,6 +3563,7 @@ func (s *AppServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Iface:           s.LocalInterface,
 		CertFingerprint: s.CertFingerprint,
 		AdminKey:        s.AdminKey,
+		Version:         Version,
 	}
 	s.mu.RUnlock()
 	data.PairingToken = s.PairingToken()
@@ -3699,6 +3730,17 @@ func promptPortIfEmpty(cliPort string) string {
 	return "8085"
 }
 
+// writeRuntimePort records the port actually bound (it may differ from the
+// requested one when that was busy) so the SSH menu can show the right link.
+// systemd sets RUNTIME_DIRECTORY when the unit declares RuntimeDirectory=.
+func writeRuntimePort(port string) {
+	dir := strings.TrimSpace(os.Getenv("RUNTIME_DIRECTORY"))
+	if dir == "" {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "port"), []byte(port+"\n"), 0o644)
+}
+
 func bindAvailableListener(preferredPort string) (net.Listener, string) {
 	basePort, err := strconv.Atoi(preferredPort)
 	if err != nil || basePort <= 0 || basePort > 65535 {
@@ -3754,12 +3796,31 @@ func main() {
 	methodFlag := flag.String("method", "udp", "Test method for -integration-peer mode (udp or icmp)")
 	countFlag := flag.Int("count", 3, "Packet count for -integration-peer mode (1..10)")
 	udpPortFlag := flag.Int("udp-port", DefaultUDPPort, "Receiver UDP port for -integration-peer mode (must be open on Server B)")
+	adminKeyFlag := flag.String("admin-key", "", "Fixed admin access key (16+ chars of A-Z a-z 0-9 - _); also read from CHECKSPOOF_ADMIN_KEY")
+	versionFlag := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
+
+	if *versionFlag || (flag.NArg() > 0 && flag.Arg(0) == "version") {
+		fmt.Println(Version)
+		return
+	}
 
 	srv, err := NewAppServer(&RealCommandRunner{})
 	if err != nil {
 		fmt.Printf("[-] Initialization error: %v\n", err)
 		os.Exit(1)
+	}
+
+	fixedKey := strings.TrimSpace(*adminKeyFlag)
+	if fixedKey == "" {
+		fixedKey = strings.TrimSpace(os.Getenv("CHECKSPOOF_ADMIN_KEY"))
+	}
+	if fixedKey != "" {
+		if !validAdminKey(fixedKey) {
+			fmt.Println("[-] Invalid admin key: use 16..128 characters of A-Z a-z 0-9 - _")
+			os.Exit(1)
+		}
+		srv.AdminKey = fixedKey
 	}
 
 	recCtx, recCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -3817,6 +3878,7 @@ func main() {
 	preferredPort := promptPortIfEmpty(*cliPort)
 	listener, activePort := bindAvailableListener(preferredPort)
 	srv.Port = activePort
+	writeRuntimePort(activePort)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -3834,7 +3896,7 @@ func main() {
 
 	ctrlIP := srv.EffectiveControlIP()
 	fmt.Println("======================================================================")
-	fmt.Printf("🛡️  CheckSpoof Enterprise v2 is running!\n")
+	fmt.Printf("🛡️  CheckSpoof v%s is running!\n", Version)
 	fmt.Printf("🆔 Server ID         : %s (Chain Prefix: CSPF_%s_*)\n", srv.ServerID, srv.InstanceChainID)
 	fmt.Printf("📍 Local Outbound IP : %s (Interface: %s)\n", srv.LocalOutboundIP, srv.LocalInterface)
 	fmt.Printf("🌐 Public IP         : %s (Source: %s, Behind NAT: %v)\n", srv.PublicIP, srv.PublicIPSource, srv.BehindNAT)
